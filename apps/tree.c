@@ -467,7 +467,11 @@ static bool aa_load(int item_idx, aa_entry_t *slot)
         }
         else
         {
-            /* This is an album or navigation entry - get album name and find a track */
+            /* Only show art for album-level entries; skip artists, genres, etc. */
+            if (tagtree_browse_tag(&tc) != tag_album)
+                return false;
+
+            /* This is an album entry - get album name and find a track */
             if (!tagtree_get_entry_name(&tc, item_idx, album_name, sizeof(album_name)))
                 return false;
 

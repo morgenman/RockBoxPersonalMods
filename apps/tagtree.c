@@ -2837,6 +2837,13 @@ char *tagtree_get_title(struct tree_context* c)
     return "?";
 }
 
+int tagtree_browse_tag(struct tree_context *c)
+{
+    if (c->currtable != TABLE_NAVIBROWSE)
+        return -1;
+    return csi->tagorder[c->currextra];
+}
+
 int tagtree_get_attr(struct tree_context* c)
 {
     int attr = -1;

@@ -42,6 +42,7 @@ char* tagtree_get_entry_name(struct tree_context *c, int id,
 bool tagtree_current_playlist_insert(int position, bool queue);
 int tagtree_add_to_playlist(const char* playlist, bool new_playlist);
 char *tagtree_get_title(struct tree_context* c);
+int tagtree_browse_tag(struct tree_context *c);
 int tagtree_get_attr(struct tree_context* c);
 int tagtree_get_icon(struct tree_context* c);
 int tagtree_get_filename(struct tree_context* c, char *buf, int buflen);

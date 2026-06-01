@@ -222,7 +222,6 @@ void sdl_window_setup(void)
 
     if (!(picture_surface = SDL_LoadBMP("UI256.bmp")))
         background = false;
-    background = false; /* disable background skin rendering */
 
     get_window_dimensions(&width, &height);
 
