@@ -449,6 +449,12 @@ void list_draw(struct screen *display, struct gui_synclist *list)
     display->set_viewport(last_vp);
 }
 
+/* Public wrapper so external code can call the default item draw function */
+void gui_list_default_draw_item(struct list_putlineinfo_t *list_info)
+{
+    _default_listdraw_fn(list_info);
+}
+
 #if defined(HAVE_TOUCHSCREEN)
 /* This needs to be fixed if we ever get more than 1 touchscreen on a target. */
 

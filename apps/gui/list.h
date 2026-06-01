@@ -100,6 +100,8 @@ struct list_putlineinfo_t {
 };
 
 typedef void list_draw_item(struct list_putlineinfo_t *list_info);
+/* Default item draw function - can be called from a custom callback */
+void gui_list_default_draw_item(struct list_putlineinfo_t *list_info);
 /*
  * Voice callback
  *  - selected_item : an integer that tells the number of the item to speak

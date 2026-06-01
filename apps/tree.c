@@ -63,7 +63,13 @@
 #include "dircache.h"
 #ifdef HAVE_TAGCACHE
 #include "tagcache.h"
+#include "metadata.h"
+#include "recorder/albumart.h"
+#include "recorder/bmp.h"
+#ifdef HAVE_JPEG
+#include "recorder/jpeg_load.h"
 #endif
+#endif /* HAVE_TAGCACHE */
 #include "yesno.h"
 #include "eeprom_settings.h"
 #include "playlist_catalog.h"
@@ -394,6 +400,347 @@ static int tree_get_file_position(char * filename)
     return(ret);
 }
 
+#ifdef HAVE_TAGCACHE
+#define AA_THUMB            44   /* max decoded thumbnail size (buffer ceiling) */
+#define AA_SLOTS            16   /* LRU-eviction cache size (increased for prefetch) */
+#define AA_PREFETCH_AHEAD   3    /* number of items to prefetch ahead */
+
+typedef struct {
+    int  item_idx;              /* -1 = unused slot */
+    bool has_art;               /* true = pixels[] has valid art */
+    int  width, height;         /* actual decoded size */
+    fb_data pixels[AA_THUMB * AA_THUMB];
+} aa_entry_t;
+
+static aa_entry_t  aa_cache[AA_SLOTS];
+static int         aa_cache_table = -1;
+static int         aa_cache_extra = -1;
+static char        aa_cache_dir[MAX_PATH] = "";  /* track current dir for file mode */
+static int         aa_evict       = 0;
+static int         aa_last_drawn  = -1;   /* track last drawn item for prefetch */
+static int         aa_thumb_sz    = AA_THUMB; /* effective thumb size derived from theme */
+
+/* Large enough for JPEG decode overhead (~38 KB) + pixel data */
+#define AA_DECODE_BUF_SIZE (AA_THUMB * AA_THUMB * sizeof(fb_data) + 50000)
+static unsigned char aa_decode_buf[AA_DECODE_BUF_SIZE];
+
+static void aa_invalidate(void)
+{
+    for (int i = 0; i < AA_SLOTS; i++)
+        aa_cache[i].item_idx = -1;
+    aa_cache_table = -1;
+    aa_cache_extra = -1;
+    aa_cache_dir[0] = '\0';
+    aa_evict = 0;
+    aa_last_drawn = -1;
+}
+
+/* Core thumbnail fetch/decode logic - used by both aa_get and aa_prefetch.
+ * Returns true if art was found and decoded, false otherwise. */
+static bool aa_load(int item_idx, aa_entry_t *slot)
+{
+    slot->item_idx = item_idx;
+    slot->has_art  = false;
+
+    bool id3db = *(tc.dirfilter) == SHOW_ID3DB;
+    char track_path[MAX_PATH];
+    char album_name[MAX_PATH];
+
+    if (id3db)
+    {
+        /* Database mode: different logic for tracks vs albums */
+        int attr = tagtree_get_attr(&tc);
+        
+        if (attr == FILE_ATTR_AUDIO)
+        {
+            /* This is a track entry - get its filename directly */
+            /* We need to temporarily set selected_item to get the right track */
+            int saved_selected = tc.selected_item;
+            tc.selected_item = item_idx;
+            int ret = tagtree_get_filename(&tc, track_path, sizeof(track_path));
+            tc.selected_item = saved_selected;
+            
+            if (ret < 0 || !track_path[0])
+                return false;
+            
+            album_name[0] = '\0'; /* Will be read from file metadata if needed */
+        }
+        else
+        {
+            /* This is an album or navigation entry - get album name and find a track */
+            if (!tagtree_get_entry_name(&tc, item_idx, album_name, sizeof(album_name)))
+                return false;
+
+            struct tagcache_search tcs;
+            struct tagcache_search_clause clause;
+            memset(&clause, 0, sizeof(clause));
+            clause.tag     = tag_album;
+            clause.type    = clause_is;
+            clause.numeric = false;
+            clause.source  = source_constant;
+            clause.str     = album_name;
+
+            track_path[0] = '\0';
+            if (tagcache_search(&tcs, tag_filename))
+            {
+                tagcache_search_add_clause(&tcs, &clause);
+                tagcache_get_next(&tcs, track_path, sizeof(track_path));
+                tagcache_search_finish(&tcs);
+            }
+            if (!track_path[0])
+                return false;
+        }
+    }
+    else
+    {
+        /* File browser mode: get the file's path directly */
+        struct entry *entry = tree_get_entry_at(&tc, item_idx);
+        if (!entry || (entry->attr & FILE_ATTR_MASK) != FILE_ATTR_AUDIO)
+            return false;
+
+        /* Build full path: currdir + filename */
+        if (tc.currdir[1]) /* not in root */
+            snprintf(track_path, sizeof(track_path), "%s/%s", tc.currdir, entry->name);
+        else
+            snprintf(track_path, sizeof(track_path), "/%s", entry->name);
+
+        album_name[0] = '\0'; /* will be read from file metadata if needed */
+    }
+
+    /* 3. Locate the art file on disk or in embedded metadata */
+    struct mp3entry id3;
+    memset(&id3, 0, sizeof(id3));
+    strmemccpy(id3.path, track_path, sizeof(id3.path));
+    id3.album = album_name;
+    const struct dim dim = { AA_THUMB, AA_THUMB };
+    char art_path[MAX_PATH];
+    bool found_file = find_albumart(&id3, art_path, sizeof(art_path), &dim);
+    bool use_embedded = false;
+
+    /* If no file found, try embedded album art */
+    if (!found_file)
+    {
+        /* Read metadata to check for embedded art */
+        if (get_metadata(&id3, -1, track_path))
+        {
+#ifdef HAVE_JPEG
+            /* Can only decode JPEG embedded art */
+            if (id3.has_embedded_albumart && 
+                (id3.albumart.type & AA_CLEAR_FLAGS_MASK) == AA_TYPE_JPG)
+            {
+                use_embedded = true;
+            }
+#endif
+        }
+        if (!use_embedded)
+            return false;
+    }
+
+    /* 4. Decode + scale to aa_thumb_sz × aa_thumb_sz */
+    struct bitmap bm;
+    memset(&bm, 0, sizeof(bm));
+    bm.width  = aa_thumb_sz;
+    bm.height = aa_thumb_sz;
+    bm.data   = aa_decode_buf;
+
+    int rc = -1;
+    
+    if (use_embedded)
+    {
+#ifdef HAVE_JPEG
+        /* Decode embedded album art */
+        int fd = open(track_path, O_RDONLY);
+        if (fd >= 0)
+        {
+            lseek(fd, id3.albumart.pos, SEEK_SET);
+            rc = clip_jpeg_fd(fd, id3.albumart.type, id3.albumart.size,
+                            &bm, sizeof(aa_decode_buf),
+                            FORMAT_NATIVE | FORMAT_RESIZE, NULL);
+            close(fd);
+        }
+#endif
+    }
+    else
+    {
+        /* Decode from external file */
+        const char *ext = strrchr(art_path, '.');
+#if defined(HAVE_JPEG)
+        if (ext && (strcasecmp(ext, ".jpg") == 0 || strcasecmp(ext, ".jpeg") == 0))
+            rc = read_jpeg_file(art_path, &bm, sizeof(aa_decode_buf),
+                                FORMAT_NATIVE | FORMAT_RESIZE, NULL);
+        else
+#endif
+            rc = read_bmp_file(art_path, &bm, sizeof(aa_decode_buf),
+                               FORMAT_NATIVE | FORMAT_RESIZE, NULL);
+    }
+
+    if (rc < 0)
+        return false;
+
+    /* 5. Copy decoded pixels to cache */
+    slot->width  = bm.width;
+    slot->height = bm.height;
+    int copy_bytes = bm.width * bm.height * sizeof(fb_data);
+    if (copy_bytes > (int)sizeof(slot->pixels))
+        copy_bytes = sizeof(slot->pixels);
+    memcpy(slot->pixels, aa_decode_buf, copy_bytes);
+    slot->has_art = true;
+    return true;
+}
+
+/* Try to prefetch an item into cache if not already present.
+ * Used for look-ahead prefetching during scroll. */
+static void aa_try_prefetch(int item_idx)
+{
+    if (item_idx < 0 || item_idx >= tc.filesindir)
+        return;
+
+    /* Already in cache? */
+    for (int i = 0; i < AA_SLOTS; i++)
+        if (aa_cache[i].item_idx == item_idx)
+            return;
+
+    /* Find a free slot (not evicting valid entries) */
+    for (int i = 0; i < AA_SLOTS; i++)
+    {
+        if (aa_cache[i].item_idx == -1)
+        {
+            aa_load(item_idx, &aa_cache[i]);
+            return;
+        }
+    }
+    /* No free slots - skip prefetch to avoid evicting visible items */
+}
+
+/* Returns pointer to decoded thumbnail pixels, or NULL if no art available.
+ * Caches results to avoid re-decoding on every redraw. */
+static const fb_data *aa_get(int item_idx)
+{
+    /* Validate item_idx is in valid range */
+    if (item_idx < 0 || item_idx >= tc.filesindir)
+        return NULL;
+    
+    bool id3db = *(tc.dirfilter) == SHOW_ID3DB;
+
+    /* Invalidate cache on navigation */
+    if (id3db)
+    {
+        if (tc.currtable != aa_cache_table || tc.currextra != aa_cache_extra)
+        {
+            aa_invalidate();
+            aa_cache_table = tc.currtable;
+            aa_cache_extra = tc.currextra;
+        }
+    }
+    else
+    {
+        if (strcmp(tc.currdir, aa_cache_dir) != 0)
+        {
+            aa_invalidate();
+            strmemccpy(aa_cache_dir, tc.currdir, sizeof(aa_cache_dir));
+        }
+    }
+
+    /* Cache hit */
+    for (int i = 0; i < AA_SLOTS; i++)
+    {
+        if (aa_cache[i].item_idx == item_idx)
+        {
+            /* Double-check this entry is still valid for current context */
+            bool valid = true;
+            if (id3db)
+                valid = (tc.currtable == aa_cache_table && tc.currextra == aa_cache_extra);
+            else
+                valid = (strcmp(tc.currdir, aa_cache_dir) == 0);
+            
+            if (valid)
+                return aa_cache[i].has_art ? aa_cache[i].pixels : NULL;
+            else
+            {
+                /* Context mismatch - invalidate this entry */
+                aa_cache[i].item_idx = -1;
+                break;
+            }
+        }
+    }
+
+    /* Cache miss — decode and evict oldest slot */
+    aa_entry_t *slot = &aa_cache[aa_evict % AA_SLOTS];
+    aa_evict++;
+
+    if (!aa_load(item_idx, slot))
+        return NULL;
+
+    return slot->pixels;
+}
+
+/* Draw item: real thumbnail on the left (if available), text on the right */
+static void albumart_list_draw_item(struct list_putlineinfo_t *info)
+{
+    /* Safety check: ensure we have valid list info */
+    if (!info || info->line < 0 || info->line >= tc.filesindir)
+    {
+        gui_list_default_draw_item(info);
+        return;
+    }
+
+    const int sz = aa_thumb_sz;
+    if (sz < 8)  /* theme row too small to show art */
+    {
+        gui_list_default_draw_item(info);
+        return;
+    }
+
+    int saved_indent = info->item_indent;
+    bool saved_have_icons = info->have_icons;
+    const fb_data *thumb = aa_get(info->line);
+
+    if (thumb)
+    {
+        /* Have art: indent text to make room for thumbnail, hide icon */
+        /* 2px left pad + sz thumb + 4px gap before text */
+        info->item_indent = saved_indent + sz + 6;
+        info->have_icons = false;  /* Hide file icon when album art is present */
+        gui_list_default_draw_item(info);
+        info->item_indent = saved_indent;
+        info->have_icons = saved_have_icons;
+
+        /* Blit the decoded thumbnail */
+        struct screen *display = info->display;
+        int x  = info->x + 2;
+        int y  = info->y + 2;
+
+        /* Safety check: ensure coordinates are reasonable */
+        if (x >= 0 && y >= 0 && x + sz <= display->lcdwidth && y + sz <= display->lcdheight)
+        {
+            display->bitmap_part((const unsigned char *)thumb,
+                                 0, 0, sz,
+                                 x, y, sz, sz);
+        }
+    }
+    else
+    {
+        /* No art: draw text normally (left-aligned, no indent) */
+        gui_list_default_draw_item(info);
+    }
+
+    /* Prefetch ahead for smooth scrolling */
+    if (info->line > aa_last_drawn)
+    {
+        /* Scrolling down - prefetch ahead */
+        for (int i = 1; i <= AA_PREFETCH_AHEAD; i++)
+            aa_try_prefetch(info->line + i);
+    }
+    else if (info->line < aa_last_drawn)
+    {
+        /* Scrolling up - prefetch behind */
+        for (int i = 1; i <= AA_PREFETCH_AHEAD; i++)
+            aa_try_prefetch(info->line - i);
+    }
+    aa_last_drawn = info->line;
+}
+#endif /* HAVE_TAGCACHE */
+
 /*
  * Called when a new dir is loaded (for example when returning from other apps ...)
  * also completely redraws the tree
@@ -416,7 +763,19 @@ static int update_dir(void)
     /* Ensure that list is initialized before update_dir returns */
     gui_synclist_init(list, &tree_get_filename, &tc, false, 1, NULL);
 
+    /* Derive thumbnail size from theme's row height; invalidate cache if it changed */
+    int new_sz = list->line_height[SCREEN_MAIN] - 4;
+    if (new_sz > AA_THUMB) new_sz = AA_THUMB;
+    if (new_sz < 0)        new_sz = 0;
+    if (new_sz != aa_thumb_sz)
+    {
+        aa_invalidate();
+        aa_thumb_sz = new_sz;
+    }
+    list->callback_draw_item = albumart_list_draw_item;
+
 #ifdef HAVE_TAGCACHE
+
     /* Checks for changes */
     if (id3db) {
         if (tc.currtable != lasttable ||
@@ -426,6 +785,7 @@ static int update_dir(void)
             if (tagtree_load(&tc) < 0)
                 return -1;
 
+            aa_invalidate(); /* new directory/table — thumbnail cache is stale */
             lasttable = tc.currtable;
             lastextra = tc.currextra;
             changed = true;
@@ -440,6 +800,9 @@ static int update_dir(void)
         {
             if (ft_load(&tc, NULL) < 0)
                 return -1;
+#ifdef HAVE_TAGCACHE
+            aa_invalidate(); /* new directory — thumbnail cache is stale */
+#endif
             strmemccpy(lastdir, tc.currdir, MAX_PATH);
             changed = true;
         }
