@@ -3581,10 +3581,19 @@ commit_error:
     return rc;
 }
 
+static void (*tc_commit_cb)(void) = NULL;
+
+void tagcache_set_commit_callback(void (*cb)(void))
+{
+    tc_commit_cb = cb;
+}
+
 void tagcache_commit_finalize(void)
 {
     tc_stat.ready = check_all_headers();
     tc_stat.readyvalid = true;
+    if (tc_commit_cb)
+        tc_commit_cb();
 }
 
 #if !defined(PLUGIN)

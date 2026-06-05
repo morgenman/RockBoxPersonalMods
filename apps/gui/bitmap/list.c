@@ -445,6 +445,42 @@ void list_draw(struct screen *display, struct gui_synclist *list)
         list_info.item_offset = item_offset;
 
         callback_draw_item(&list_info);
+
+#if LCD_DEPTH > 1
+        /* Rounded corners — applied to every list item when list_corner_radius > 0.
+         * Precomputed quarter-circle arc widths per row for each even radius 2..12.
+         * Arc[idx][r] = number of bg-filled pixels at column 0 on row r from corner. */
+        if (display->screen_type == SCREEN_MAIN)
+        {
+            int radius = global_settings.list_corner_radius;
+            if (radius >= 2 && radius <= 12 && (radius & 1) == 0)
+            {
+                static const int8_t arcs[6][12] = {
+                    /* r=2  */ {  2,  1,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0 },
+                    /* r=4  */ {  4,  2,  1,  1,  0,  0,  0,  0,  0,  0,  0,  0 },
+                    /* r=6  */ {  6,  3,  2,  1,  1,  1,  0,  0,  0,  0,  0,  0 },
+                    /* r=8  */ {  8,  5,  3,  2,  1,  1,  1,  1,  0,  0,  0,  0 },
+                    /* r=10 */ { 10,  6,  4,  3,  2,  1,  1,  1,  1,  1,  0,  0 },
+                    /* r=12 */ { 12,  8,  6,  4,  3,  2,  2,  1,  1,  1,  1,  1 },
+                };
+                int idx   = radius / 2 - 1;
+                int row_h = linedes.height;
+                int vp_w  = list_text_vp->width;
+                unsigned saved_fg = display->get_foreground();
+                display->set_foreground(display->get_background());
+                for (int r = 0; r < radius; r++)
+                {
+                    int w = arcs[idx][r];
+                    if (w <= 0) break;
+                    display->fillrect(0,        list_info.y + r,             w, 1);
+                    display->fillrect(vp_w - w, list_info.y + r,             w, 1);
+                    display->fillrect(0,        list_info.y + row_h - 1 - r, w, 1);
+                    display->fillrect(vp_w - w, list_info.y + row_h - 1 - r, w, 1);
+                }
+                display->set_foreground(saved_fg);
+            }
+        }
+#endif
     }
     display->set_viewport(last_vp);
 }

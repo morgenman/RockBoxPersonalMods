@@ -122,6 +122,13 @@ void resume_directory(const char *dir);
 void tree_lock_cache(struct tree_context *t);
 void tree_unlock_cache(struct tree_context *t);
 
+#ifdef HAVE_TAGCACHE
+/* Delete all files in the thumbnail cache directory (call before a full DB rebuild). */
+void aa_thumbcache_clear(void);
+/* Schedule thumb generation after the next tagcache commit completes. */
+void aa_thumbcache_refresh(void);
+#endif
+
 #ifdef WIN32
 /* it takes an int on windows */
 #define getcwd_size_t int

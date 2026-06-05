@@ -385,6 +385,14 @@ MENUITEM_SETTING(cursor_style, &global_settings.cursor_style, NULL);
 #if LCD_DEPTH > 1
 MENUITEM_SETTING(sep_menu, &global_settings.list_separator_height, NULL);
 #endif
+#if LCD_DEPTH > 1 && defined(HAVE_TAGCACHE)
+MENUITEM_SETTING(show_album_art_setting, &global_settings.show_album_art, NULL);
+MENUITEM_SETTING(thumb_row_height_setting, &global_settings.thumb_row_height, NULL);
+MENUITEM_SETTING(thumb_art_padding_setting, &global_settings.thumb_art_padding, NULL);
+#endif
+#if LCD_DEPTH > 1
+MENUITEM_SETTING(list_corner_radius_setting, &global_settings.list_corner_radius, NULL);
+#endif
 
 MAKE_MENU(theme_menu, ID2P(LANG_THEME_MENU),
             NULL, Icon_Wps,
@@ -412,6 +420,12 @@ MAKE_MENU(theme_menu, ID2P(LANG_THEME_MENU),
             &cursor_style,
 #if LCD_DEPTH > 1
             &sep_menu,
+            &list_corner_radius_setting,
+#endif
+#if LCD_DEPTH > 1 && defined(HAVE_TAGCACHE)
+            &show_album_art_setting,
+            &thumb_row_height_setting,
+            &thumb_art_padding_setting,
 #endif
 #ifdef HAVE_LCD_COLOR
             &colors_settings,

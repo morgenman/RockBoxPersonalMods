@@ -591,6 +591,11 @@ struct user_settings
 #if LCD_DEPTH > 1
     int list_separator_height; /* -1=auto (== 1 currently), 0=disabled, X=height in pixels */
     int list_separator_color;
+    bool show_album_art;     /* show album art thumbnails in database browser */
+    int thumb_row_height;    /* -1=auto (from theme font), X=override row height in pixels */
+    int thumb_art_padding;   /* padding around artwork inside its container (0-6 px per side) */
+    unsigned char thumb_fallback_file[MAX_PATHNAME+1]; /* full path to fallback BMP, or empty */
+    int list_corner_radius;  /* 0=off, or radius in px (2/4/6/8/10/12); set by theme or user */
 #endif
     /* goto current song when exiting WPS */
     bool browse_current; /* 1=goto current song,

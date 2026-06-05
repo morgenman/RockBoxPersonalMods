@@ -69,6 +69,7 @@
 #ifdef HAVE_JPEG
 #include "recorder/jpeg_load.h"
 #endif
+#include "crc32.h"
 #endif /* HAVE_TAGCACHE */
 #include "yesno.h"
 #include "eeprom_settings.h"
@@ -349,10 +350,17 @@ bool check_rockboxdir(void)
 }
 
 /* do this really late in the init sequence */
+#ifdef HAVE_TAGCACHE
+static void aa_thread_init(void);
+#endif
+
 void tree_init(void)
 {
     check_rockboxdir();
     strcpy(tc.currdir, "/");
+#ifdef HAVE_TAGCACHE
+    aa_thread_init();
+#endif
 }
 
 struct tree_context* tree_get_context(void)
@@ -402,171 +410,219 @@ static int tree_get_file_position(char * filename)
 
 #ifdef HAVE_TAGCACHE
 #define AA_THUMB            44   /* max decoded thumbnail size (buffer ceiling) */
-#define AA_SLOTS            16   /* LRU-eviction cache size (increased for prefetch) */
-#define AA_PREFETCH_AHEAD   3    /* number of items to prefetch ahead */
+#define AA_SLOTS            32   /* LRU cache slots */
+#define AA_PREFETCH_AHEAD   5    /* items to prefetch in the scroll direction */
+#define AA_THUMBCACHE_DIR   ROCKBOX_DIR "/thumbcache"
+
+/* Decode-thread message IDs */
+#define AA_Q_DECODE  1
+#define AA_Q_QUIT    2
+#define AA_Q_REFRESH 3
 
 typedef struct {
-    int  item_idx;              /* -1 = unused slot */
-    bool has_art;               /* true = pixels[] has valid art */
-    int  width, height;         /* actual decoded size */
+    int  item_idx;                  /* -1 = unused */
+    bool has_art;                   /* pixels[] is valid */
+    bool pending;                   /* decode in progress on bg thread */
+    int  width, height;             /* actual decoded dimensions */
+    char track_path[MAX_PATH];      /* resolved by main thread before queuing */
+    char album_name[MAX_PATH];      /* used by find_albumart as a hint */
     fb_data pixels[AA_THUMB * AA_THUMB];
 } aa_entry_t;
 
-static aa_entry_t  aa_cache[AA_SLOTS];
-static int         aa_cache_table = -1;
-static int         aa_cache_extra = -1;
-static char        aa_cache_dir[MAX_PATH] = "";  /* track current dir for file mode */
-static int         aa_evict       = 0;
-static int         aa_last_drawn  = -1;   /* track last drawn item for prefetch */
-static int         aa_thumb_sz    = AA_THUMB; /* effective thumb size derived from theme */
+static aa_entry_t         aa_cache[AA_SLOTS];
+static int                aa_cache_table = -1;
+static int                aa_cache_extra = -1;
+static char               aa_cache_dir[MAX_PATH] = "";
+static int                aa_evict      = 0;
+static int                aa_scroll_dir = 0;   /* +1 down, -1 up, 0 unknown */
+static int                aa_prev_start = -1;  /* start_item from previous frame */
+static int                aa_thumb_sz   = AA_THUMB;
+static int                aa_art_pad    = 0;   /* per-side padding around artwork */
 
-/* Large enough for JPEG decode overhead (~38 KB) + pixel data */
+static struct mutex       aa_mutex;
+static struct event_queue aa_queue;
+static long               aa_thread_stack[(DEFAULT_STACK_SIZE + 0x2000) / sizeof(long)];
+static unsigned int       aa_thread_id = 0;
+static volatile bool      aa_redraw_needed = false;
+static volatile bool      aa_pending_refresh = false; /* set by user action; gates startup */
+static aa_entry_t         aa_gen_slot; /* reusable slot for bulk thumb generation */
+
+/* Fallback image: theme-supplied BMP drawn for items with no art.
+ * Source path comes from global_settings.thumb_fallback_file (theme-configurable).
+ * A scaled .bin is cached in thumbcache, keyed on CRC32(path) + size. */
+#define AA_FALLBACK_CACHE_FMT  AA_THUMBCACHE_DIR "/fallback_%08x_%d.bin"
+static fb_data           aa_fallback_pixels[AA_THUMB * AA_THUMB];
+static volatile int      aa_fallback_sz  = 0; /* 0 = not loaded; set by decode thread */
+static volatile uint32_t aa_fallback_crc = 0; /* CRC32 of the loaded source path */
+
+/* Large enough for JPEG decode overhead + pixel data; owned by decode thread */
 #define AA_DECODE_BUF_SIZE (AA_THUMB * AA_THUMB * sizeof(fb_data) + 50000)
 static unsigned char aa_decode_buf[AA_DECODE_BUF_SIZE];
 
-static void aa_invalidate(void)
+/* Clear all cache slots. Caller must hold aa_mutex. */
+static void _aa_do_invalidate(void)
 {
     for (int i = 0; i < AA_SLOTS; i++)
+    {
         aa_cache[i].item_idx = -1;
-    aa_cache_table = -1;
-    aa_cache_extra = -1;
+        aa_cache[i].pending  = false;
+    }
+    aa_cache_table  = -1;
+    aa_cache_extra  = -1;
     aa_cache_dir[0] = '\0';
-    aa_evict = 0;
-    aa_last_drawn = -1;
+    aa_evict        = 0;
+    aa_scroll_dir   = 0;
+    aa_prev_start   = -1;
 }
 
-/* Core thumbnail fetch/decode logic - used by both aa_get and aa_prefetch.
- * Returns true if art was found and decoded, false otherwise. */
-static bool aa_load(int item_idx, aa_entry_t *slot)
+/* Invalidate from outside a mutex-held context (e.g. update_dir). */
+static void aa_invalidate(void)
 {
-    slot->item_idx = item_idx;
-    slot->has_art  = false;
+    mutex_lock(&aa_mutex);
+    _aa_do_invalidate();
+    mutex_unlock(&aa_mutex);
+}
 
-    bool id3db = *(tc.dirfilter) == SHOW_ID3DB;
-    char track_path[MAX_PATH];
-    char album_name[MAX_PATH];
+/* Resolve item_idx → album_name for use as the cache key.
+ * Only looks up the name from the in-memory tagtree buffer — no tagcache
+ * searches, so this is safe and fast to call from the draw callback.
+ * track_path is left empty; the full tagcache lookup happens only in the
+ * decode thread (aa_generate_to_slot / aa_build_thumbcache). */
+static bool aa_resolve_path(int item_idx, char *track_path, char *album_name)
+{
+    track_path[0] = '\0';
+    album_name[0] = '\0';
 
-    if (id3db)
+    if (*(tc.dirfilter) != SHOW_ID3DB)
+        return false; /* file browser: no art */
+
+    /* Virtual navigation entries ([By Album], [All Tracks], [Random], …) occupy
+     * the first special_entry_count slots and have no associated album art. */
+    if (item_idx < tc.special_entry_count)
+        return false;
+
+    int attr = tagtree_get_attr(&tc);
+    if (attr == FILE_ATTR_AUDIO)
     {
-        /* Database mode: different logic for tracks vs albums */
-        int attr = tagtree_get_attr(&tc);
-        
-        if (attr == FILE_ATTR_AUDIO)
-        {
-            /* This is a track entry - get its filename directly */
-            /* We need to temporarily set selected_item to get the right track */
-            int saved_selected = tc.selected_item;
-            tc.selected_item = item_idx;
-            int ret = tagtree_get_filename(&tc, track_path, sizeof(track_path));
-            tc.selected_item = saved_selected;
-            
-            if (ret < 0 || !track_path[0])
-                return false;
-            
-            album_name[0] = '\0'; /* Will be read from file metadata if needed */
-        }
-        else
-        {
-            /* Only show art for album-level entries; skip artists, genres, etc. */
-            if (tagtree_browse_tag(&tc) != tag_album)
-                return false;
-
-            /* This is an album entry - get album name and find a track */
-            if (!tagtree_get_entry_name(&tc, item_idx, album_name, sizeof(album_name)))
-                return false;
-
-            struct tagcache_search tcs;
-            struct tagcache_search_clause clause;
-            memset(&clause, 0, sizeof(clause));
-            clause.tag     = tag_album;
-            clause.type    = clause_is;
-            clause.numeric = false;
-            clause.source  = source_constant;
-            clause.str     = album_name;
-
-            track_path[0] = '\0';
-            if (tagcache_search(&tcs, tag_filename))
-            {
-                tagcache_search_add_clause(&tcs, &clause);
-                tagcache_get_next(&tcs, track_path, sizeof(track_path));
-                tagcache_search_finish(&tcs);
-            }
-            if (!track_path[0])
-                return false;
-        }
+        /* Track (TABLE_NAVIBROWSE tag_title, TABLE_ALLSUBENTRIES*): use the
+         * per-entry album_name field which is populated from tag_album for every
+         * track regardless of which table we're in.  This is correct even in
+         * [All Tracks] / [By Album] views where tagtree_get_title() returns
+         * the artist name, not the album name. */
+        if (!tagtree_get_entry_album(&tc, item_idx, album_name, MAX_PATH))
+            return false;
     }
     else
     {
-        /* File browser mode: get the file's path directly */
-        struct entry *entry = tree_get_entry_at(&tc, item_idx);
-        if (!entry || (entry->attr & FILE_ATTR_MASK) != FILE_ATTR_AUDIO)
+        /* Album view (TABLE_NAVIBROWSE tag_album): the entry name IS the album. */
+        if (tagtree_browse_tag(&tc) != tag_album) return false;
+        if (!tagtree_get_entry_name(&tc, item_idx, album_name, MAX_PATH))
             return false;
+    }
+    return true;
+}
 
-        /* Build full path: currdir + filename */
-        if (tc.currdir[1]) /* not in root */
-            snprintf(track_path, sizeof(track_path), "%s/%s", tc.currdir, entry->name);
-        else
-            snprintf(track_path, sizeof(track_path), "/%s", entry->name);
+/* Build the disk-cache path keyed on the album name and thumb size. */
+static void aa_thumb_cache_path(char *buf, const char *album_name, int sz)
+{
+    uint32_t hash = crc_32(album_name, strlen(album_name), 0xffffffff);
+    snprintf(buf, MAX_PATH, AA_THUMBCACHE_DIR "/t%08x_%d.bin",
+             (unsigned)hash, sz);
+}
 
-        album_name[0] = '\0'; /* will be read from file metadata if needed */
+static void aa_fallback_cache_path(char *buf, const char *source_path, int sz)
+{
+    uint32_t hash = crc_32(source_path, strlen(source_path), 0xffffffff);
+    snprintf(buf, MAX_PATH, AA_FALLBACK_CACHE_FMT, (unsigned)hash, sz);
+}
+
+/* Read a pre-built thumbnail from the disk cache into slot->pixels.
+ * Browse-time path: no JPEG decode, no fallback — cache or nothing. */
+static bool aa_load_from_cache(aa_entry_t *slot, int thumb_sz)
+{
+    char cache_path[MAX_PATH];
+    aa_thumb_cache_path(cache_path, slot->album_name, thumb_sz);
+    int expected_bytes = thumb_sz * thumb_sz * (int)sizeof(fb_data);
+
+    int cfd = open(cache_path, O_RDONLY);
+    if (cfd < 0) return false;
+
+    bool ok = (filesize(cfd) == expected_bytes &&
+               read(cfd, aa_decode_buf, expected_bytes) == expected_bytes);
+    close(cfd);
+    if (!ok) return false;
+
+    slot->width  = thumb_sz;
+    slot->height = thumb_sz;
+    memcpy(slot->pixels, aa_decode_buf, expected_bytes);
+    return true;
+}
+
+/* Decode art from slot->track_path via JPEG/BMP, write the disk cache, and
+ * populate slot->pixels. Only called from aa_build_thumbcache, never during
+ * live browsing. */
+static bool aa_generate_to_slot(aa_entry_t *slot, int thumb_sz)
+{
+    char cache_path[MAX_PATH];
+    aa_thumb_cache_path(cache_path, slot->album_name, thumb_sz);
+    int expected_bytes = thumb_sz * thumb_sz * (int)sizeof(fb_data);
+
+    /* Skip if already cached at this size */
+    int cfd = open(cache_path, O_RDONLY);
+    if (cfd >= 0)
+    {
+        bool ok = (filesize(cfd) == expected_bytes);
+        close(cfd);
+        if (ok) return true;
     }
 
-    /* 3. Locate the art file on disk or in embedded metadata */
     struct mp3entry id3;
     memset(&id3, 0, sizeof(id3));
-    strmemccpy(id3.path, track_path, sizeof(id3.path));
-    id3.album = album_name;
-    const struct dim dim = { AA_THUMB, AA_THUMB };
+    strmemccpy(id3.path, slot->track_path, sizeof(id3.path));
+    id3.album = slot->album_name;
+
+    const struct dim dim = { thumb_sz, thumb_sz };
     char art_path[MAX_PATH];
     bool found_file = find_albumart(&id3, art_path, sizeof(art_path), &dim);
     bool use_embedded = false;
 
-    /* If no file found, try embedded album art */
     if (!found_file)
     {
-        /* Read metadata to check for embedded art */
-        if (get_metadata(&id3, -1, track_path))
+        if (get_metadata(&id3, -1, slot->track_path))
         {
 #ifdef HAVE_JPEG
-            /* Can only decode JPEG embedded art */
-            if (id3.has_embedded_albumart && 
+            if (id3.has_embedded_albumart &&
                 (id3.albumart.type & AA_CLEAR_FLAGS_MASK) == AA_TYPE_JPG)
-            {
                 use_embedded = true;
-            }
 #endif
         }
         if (!use_embedded)
             return false;
     }
 
-    /* 4. Decode + scale to aa_thumb_sz × aa_thumb_sz */
     struct bitmap bm;
     memset(&bm, 0, sizeof(bm));
-    bm.width  = aa_thumb_sz;
-    bm.height = aa_thumb_sz;
+    bm.width  = thumb_sz;
+    bm.height = thumb_sz;
     bm.data   = aa_decode_buf;
 
     int rc = -1;
-    
     if (use_embedded)
     {
 #ifdef HAVE_JPEG
-        /* Decode embedded album art */
-        int fd = open(track_path, O_RDONLY);
+        int fd = open(slot->track_path, O_RDONLY);
         if (fd >= 0)
         {
             lseek(fd, id3.albumart.pos, SEEK_SET);
             rc = clip_jpeg_fd(fd, id3.albumart.type, id3.albumart.size,
-                            &bm, sizeof(aa_decode_buf),
-                            FORMAT_NATIVE | FORMAT_RESIZE, NULL);
+                              &bm, sizeof(aa_decode_buf),
+                              FORMAT_NATIVE | FORMAT_RESIZE, NULL);
             close(fd);
         }
 #endif
     }
     else
     {
-        /* Decode from external file */
         const char *ext = strrchr(art_path, '.');
 #if defined(HAVE_JPEG)
         if (ext && (strcasecmp(ext, ".jpg") == 0 || strcasecmp(ext, ".jpeg") == 0))
@@ -578,60 +634,340 @@ static bool aa_load(int item_idx, aa_entry_t *slot)
                                FORMAT_NATIVE | FORMAT_RESIZE, NULL);
     }
 
-    if (rc < 0)
-        return false;
+    if (rc < 0) return false;
 
-    /* 5. Copy decoded pixels to cache */
     slot->width  = bm.width;
     slot->height = bm.height;
     int copy_bytes = bm.width * bm.height * sizeof(fb_data);
     if (copy_bytes > (int)sizeof(slot->pixels))
         copy_bytes = sizeof(slot->pixels);
     memcpy(slot->pixels, aa_decode_buf, copy_bytes);
-    slot->has_art = true;
+
+    if (bm.width == thumb_sz && bm.height == thumb_sz)
+    {
+        int wfd = open(cache_path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+        if (wfd >= 0)
+        {
+            write(wfd, aa_decode_buf, expected_bytes);
+            close(wfd);
+        }
+    }
+
     return true;
 }
 
-/* Try to prefetch an item into cache if not already present.
- * Used for look-ahead prefetching during scroll. */
+/* Delete every file in the thumbcache dir. Called from the main thread before
+ * a full DB rebuild so orphan files don't survive the regeneration pass. */
+void aa_thumbcache_clear(void)
+{
+    DIR *dir = opendir(AA_THUMBCACHE_DIR);
+    if (!dir) return;
+    struct dirent *de;
+    char path[MAX_PATH];
+    while ((de = readdir(dir)) != NULL)
+    {
+        if (de->d_name[0] == '.') continue;
+        snprintf(path, MAX_PATH, AA_THUMBCACHE_DIR "/%s", de->d_name);
+        remove(path);
+    }
+    closedir(dir);
+}
+
+/* Decode the BMP at source_path, scale to sz, and write a .bin to thumbcache.
+ * Caller must have already confirmed source_path exists with open().
+ * Used by aa_build_thumbcache (bulk) and aa_load_fallback (on-demand). */
+static void aa_build_fallback_cache(const char *source_path, int sz)
+{
+    char cache_path[MAX_PATH];
+    aa_fallback_cache_path(cache_path, source_path, sz);
+    int expected = sz * sz * (int)sizeof(fb_data);
+
+    int cfd = open(cache_path, O_RDONLY);
+    if (cfd >= 0)
+    {
+        bool ok = (filesize(cfd) == expected);
+        close(cfd);
+        if (ok) return;
+    }
+
+    struct bitmap bm;
+    memset(&bm, 0, sizeof(bm));
+    bm.width  = sz;
+    bm.height = sz;
+    bm.data   = aa_decode_buf;
+    int rc = read_bmp_file(source_path, &bm, sizeof(aa_decode_buf),
+                           FORMAT_NATIVE | FORMAT_RESIZE, NULL);
+    if (rc < 0 || bm.width != sz || bm.height != sz) return;
+
+    int wfd = open(cache_path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if (wfd >= 0)
+    {
+        write(wfd, aa_decode_buf, expected);
+        close(wfd);
+    }
+}
+
+/* Load the fallback image for thumb_sz into aa_fallback_pixels.
+ * Source path comes from global_settings.thumb_fallback_file.
+ * Tries the pre-built .bin in thumbcache first; generates it on-demand if
+ * absent.  Silently does nothing if no fallback file is configured or the
+ * source BMP is missing.  Runs in the decode thread only. */
+static void aa_load_fallback(int thumb_sz)
+{
+    aa_fallback_sz  = 0;
+    aa_fallback_crc = 0;
+
+    const char *source_path = (const char *)global_settings.thumb_fallback_file;
+    if (!source_path[0]) return;
+
+    uint32_t path_crc = crc_32(source_path, strlen(source_path), 0xffffffff);
+    char cache_path[MAX_PATH];
+    aa_fallback_cache_path(cache_path, source_path, thumb_sz);
+    int expected = thumb_sz * thumb_sz * (int)sizeof(fb_data);
+
+    int cfd = open(cache_path, O_RDONLY);
+    if (cfd >= 0)
+    {
+        bool ok = (filesize(cfd) == expected &&
+                   read(cfd, (void *)aa_fallback_pixels, expected) == expected);
+        close(cfd);
+        if (ok) { aa_fallback_sz = thumb_sz; aa_fallback_crc = path_crc; return; }
+    }
+
+    /* .bin absent — check source exists to avoid DEBUGF from read_bmp_file */
+    int bfd = open(source_path, O_RDONLY);
+    if (bfd < 0) return;
+    close(bfd);
+
+    aa_build_fallback_cache(source_path, thumb_sz);
+
+    cfd = open(cache_path, O_RDONLY);
+    if (cfd < 0) return;
+    bool ok = (filesize(cfd) == expected &&
+               read(cfd, (void *)aa_fallback_pixels, expected) == expected);
+    close(cfd);
+    if (ok) { aa_fallback_sz = thumb_sz; aa_fallback_crc = path_crc; }
+}
+
+/* Generate exactly one disk-cached thumb per album.
+ * Iterates unique album names; for each finds the representative track using
+ * the same query the browse view uses (folder image first, embedded fallback).
+ * Runs in the decode thread; yields between albums. */
+static void aa_build_thumbcache(void)
+{
+    /* If a row height override is active, compute the size directly from the
+     * setting — aa_thumb_sz may be stale if the browser hasn't been opened
+     * since the setting was changed. */
+    int sz = (global_settings.thumb_row_height > 0)
+             ? MIN(global_settings.thumb_row_height - 4, AA_THUMB)
+             : aa_thumb_sz;
+    if (sz < 8 || !tagcache_is_usable()) return;
+
+    struct tagcache_search tcs;
+    if (!tagcache_search(&tcs, tag_album))
+        return;
+
+    char prev_album[MAX_PATH] = "";
+
+    while (tagcache_get_next(&tcs, aa_gen_slot.album_name, MAX_PATH))
+    {
+        /* De-duplicate consecutive identical album names */
+        if (strcmp(aa_gen_slot.album_name, prev_album) == 0)
+        {
+            yield();
+            continue;
+        }
+        strmemccpy(prev_album, aa_gen_slot.album_name, MAX_PATH);
+
+        /* Find the representative track for this album (same query as browse) */
+        struct tagcache_search tcs2;
+        struct tagcache_search_clause clause;
+        memset(&clause, 0, sizeof(clause));
+        clause.tag     = tag_album;
+        clause.type    = clause_is;
+        clause.numeric = false;
+        clause.source  = source_constant;
+        clause.str     = aa_gen_slot.album_name;
+
+        aa_gen_slot.track_path[0] = '\0';
+        if (tagcache_search(&tcs2, tag_filename))
+        {
+            tagcache_search_add_clause(&tcs2, &clause);
+            tagcache_get_next(&tcs2, aa_gen_slot.track_path, MAX_PATH);
+            tagcache_search_finish(&tcs2);
+        }
+
+        if (!aa_gen_slot.track_path[0]) { yield(); continue; }
+
+        /* generate (or skip if already cached); find_albumart tries folder
+         * images first, then we fall back to embedded art if not found */
+        aa_generate_to_slot(&aa_gen_slot, sz);
+        yield();
+    }
+    tagcache_search_finish(&tcs);
+
+    /* Generate the fallback .bin for the currently configured fallback image */
+    const char *fb_path = (const char *)global_settings.thumb_fallback_file;
+    if (fb_path[0])
+    {
+        int bfd = open(fb_path, O_RDONLY);
+        if (bfd >= 0) { close(bfd); aa_build_fallback_cache(fb_path, sz); }
+    }
+}
+
+/* Called from the tagcache commit callback. Only posts a refresh job when the
+ * user explicitly triggered a DB operation (not on every startup). */
+static void aa_on_db_commit(void)
+{
+    if (!aa_pending_refresh) return;
+    aa_pending_refresh = false;
+    queue_post(&aa_queue, AA_Q_REFRESH, 0);
+}
+
+/* Schedule a thumb cache rebuild after the next tagcache commit. */
+void aa_thumbcache_refresh(void)
+{
+    aa_pending_refresh = true;
+}
+
+/* Background decode thread: waits for requests, decodes, writes result to cache. */
+static void aa_decode_thread(void)
+{
+    struct queue_event ev;
+    while (1)
+    {
+        queue_wait(&aa_queue, &ev);
+        if (ev.id == AA_Q_QUIT) break;
+        if (ev.id == AA_Q_REFRESH) { aa_build_thumbcache(); continue; }
+        if (ev.id != AA_Q_DECODE) continue;
+
+        int item_idx = (int)ev.data;
+        int thumb_sz = aa_thumb_sz;
+
+        /* Reload fallback if size or configured source path changed */
+        {
+            const char *fb = (const char *)global_settings.thumb_fallback_file;
+            uint32_t fb_crc = fb[0]
+                ? crc_32(fb, strlen(fb), 0xffffffff) : 0;
+            if (aa_fallback_sz != thumb_sz || aa_fallback_crc != fb_crc)
+                aa_load_fallback(thumb_sz);
+        }
+
+        /* Find the pending slot (brief lock to read pointer) */
+        mutex_lock(&aa_mutex);
+        aa_entry_t *slot = NULL;
+        for (int i = 0; i < AA_SLOTS; i++)
+        {
+            if (aa_cache[i].item_idx == item_idx && aa_cache[i].pending)
+            {
+                slot = &aa_cache[i];
+                break;
+            }
+        }
+        mutex_unlock(&aa_mutex);
+
+        if (!slot) continue; /* evicted before we could decode */
+
+        /* Load from disk cache only — no JPEG decode during live browsing */
+        bool has_art = aa_load_from_cache(slot, thumb_sz);
+
+        /* Write result under lock, only if slot still belongs to this item */
+        mutex_lock(&aa_mutex);
+        if (slot->item_idx == item_idx && slot->pending)
+        {
+            slot->has_art = has_art;
+            slot->pending = false;
+        }
+        else if (!slot->pending)
+        {
+            /* Slot was reassigned; discard — pixels were written but won't be read */
+        }
+        mutex_unlock(&aa_mutex);
+
+        /* Wake the main thread so it redraws without waiting for the HZ/2 timeout */
+        aa_redraw_needed = true;
+        button_queue_try_post(BUTTON_NONE, 0);
+    }
+}
+
+/* Allocate a cache slot for item_idx and post a decode request.
+ * Caller must NOT hold aa_mutex. track_path/album_name must already be set.
+ * Eviction priority: empty > pending (abandon) > no-art > decoded (LRU). */
+static void aa_queue_decode(int item_idx,
+                            const char *track_path, const char *album_name)
+{
+    /* Don't evict a decoded slot for a decode we can't even queue */
+    if (queue_full(&aa_queue))
+        return;
+
+    mutex_lock(&aa_mutex);
+
+    aa_entry_t *slot = NULL;
+    /* 1. Empty slot */
+    for (int i = 0; i < AA_SLOTS && !slot; i++)
+        if (aa_cache[i].item_idx == -1) slot = &aa_cache[i];
+    /* 2. Pending slot — decode thread discards stale result via item_idx check */
+    for (int i = 0; i < AA_SLOTS && !slot; i++)
+        if (aa_cache[i].pending) slot = &aa_cache[i];
+    /* 3. Confirmed no-art slot */
+    for (int i = 0; i < AA_SLOTS && !slot; i++)
+        if (!aa_cache[i].has_art) slot = &aa_cache[i];
+    /* 4. LRU eviction of a decoded slot */
+    if (!slot) {
+        slot = &aa_cache[aa_evict % AA_SLOTS];
+        aa_evict++;
+    }
+
+    slot->item_idx = item_idx;
+    slot->has_art  = false;
+    slot->pending  = true;
+    strmemccpy(slot->track_path, track_path, MAX_PATH);
+    strmemccpy(slot->album_name, album_name, MAX_PATH);
+
+    mutex_unlock(&aa_mutex);
+    queue_post(&aa_queue, AA_Q_DECODE, (intptr_t)item_idx);
+}
+
+/* Queue a prefetch decode for item_idx if it is not already cached or pending. */
 static void aa_try_prefetch(int item_idx)
 {
     if (item_idx < 0 || item_idx >= tc.filesindir)
         return;
 
-    /* Already in cache? */
+    mutex_lock(&aa_mutex);
     for (int i = 0; i < AA_SLOTS; i++)
         if (aa_cache[i].item_idx == item_idx)
-            return;
-
-    /* Find a free slot (not evicting valid entries) */
-    for (int i = 0; i < AA_SLOTS; i++)
-    {
-        if (aa_cache[i].item_idx == -1)
         {
-            aa_load(item_idx, &aa_cache[i]);
+            mutex_unlock(&aa_mutex);
             return;
         }
-    }
-    /* No free slots - skip prefetch to avoid evicting visible items */
+    mutex_unlock(&aa_mutex);
+
+    char track_path[MAX_PATH], album_name[MAX_PATH];
+    if (!aa_resolve_path(item_idx, track_path, album_name))
+        return;
+
+    aa_queue_decode(item_idx, track_path, album_name);
 }
 
-/* Returns pointer to decoded thumbnail pixels, or NULL if no art available.
- * Caches results to avoid re-decoding on every redraw. */
+/* Returns decoded pixels for item_idx, or NULL if not yet available.
+ * On a cache miss the decode is queued asynchronously; NULL is returned
+ * immediately and the list will show art on the next natural redraw. */
 static const fb_data *aa_get(int item_idx)
 {
-    /* Validate item_idx is in valid range */
     if (item_idx < 0 || item_idx >= tc.filesindir)
         return NULL;
-    
+
     bool id3db = *(tc.dirfilter) == SHOW_ID3DB;
 
-    /* Invalidate cache on navigation */
+    mutex_lock(&aa_mutex);
+
+    /* Invalidate on navigation change */
     if (id3db)
     {
         if (tc.currtable != aa_cache_table || tc.currextra != aa_cache_extra)
         {
-            aa_invalidate();
+            _aa_do_invalidate();
             aa_cache_table = tc.currtable;
             aa_cache_extra = tc.currextra;
         }
@@ -640,48 +976,100 @@ static const fb_data *aa_get(int item_idx)
     {
         if (strcmp(tc.currdir, aa_cache_dir) != 0)
         {
-            aa_invalidate();
+            _aa_do_invalidate();
             strmemccpy(aa_cache_dir, tc.currdir, sizeof(aa_cache_dir));
         }
     }
 
-    /* Cache hit */
+    /* Cache hit (includes pending slots — return NULL while decoding) */
     for (int i = 0; i < AA_SLOTS; i++)
     {
         if (aa_cache[i].item_idx == item_idx)
         {
-            /* Double-check this entry is still valid for current context */
-            bool valid = true;
-            if (id3db)
-                valid = (tc.currtable == aa_cache_table && tc.currextra == aa_cache_extra);
-            else
-                valid = (strcmp(tc.currdir, aa_cache_dir) == 0);
-            
-            if (valid)
-                return aa_cache[i].has_art ? aa_cache[i].pixels : NULL;
-            else
-            {
-                /* Context mismatch - invalidate this entry */
-                aa_cache[i].item_idx = -1;
-                break;
-            }
+            const fb_data *result =
+                (!aa_cache[i].pending && aa_cache[i].has_art)
+                    ? aa_cache[i].pixels : NULL;
+            mutex_unlock(&aa_mutex);
+            return result;
         }
     }
 
-    /* Cache miss — decode and evict oldest slot */
-    aa_entry_t *slot = &aa_cache[aa_evict % AA_SLOTS];
-    aa_evict++;
+    mutex_unlock(&aa_mutex);
 
-    if (!aa_load(item_idx, slot))
+    /* Cache miss — resolve path on main thread, then queue async decode */
+    char track_path[MAX_PATH], album_name[MAX_PATH];
+    if (!aa_resolve_path(item_idx, track_path, album_name))
         return NULL;
 
-    return slot->pixels;
+    aa_queue_decode(item_idx, track_path, album_name);
+    return NULL;
 }
 
-/* Draw item: real thumbnail on the left (if available), text on the right */
+static void aa_thread_init(void)
+{
+    mutex_init(&aa_mutex);
+    queue_init(&aa_queue, false);
+    _aa_do_invalidate();
+    mkdir(AA_THUMBCACHE_DIR); /* no-op if already exists */
+    tagcache_set_commit_callback(aa_on_db_commit);
+    aa_thread_id = create_thread(aa_decode_thread, aa_thread_stack,
+                                 sizeof(aa_thread_stack), 0,
+                                 "aa_decode" IF_PRIO(, PRIORITY_BACKGROUND)
+                                 IF_COP(, CPU));
+}
+
+/* Draw art, fallback image, or centered icon inside the artwork container.
+ * art_x/art_y is the top-left of the container (sz + 2*pad wide/tall).
+ * pad adds inset space between the container edge and the actual artwork.
+ * linedes drives the icon drawmode so it matches line.c's put_icon(). */
+static void aa_draw_art_area(struct screen *display, int art_x, int art_y,
+                             int sz, int pad, int line_h,
+                             enum themable_icons icon, const fb_data *thumb,
+                             const struct line_desc *linedes, bool allow_fallback)
+{
+    /* Artwork sits pad pixels inside the container; vertical centre accounts
+     * for both the row margin (2px) and the padding naturally via line_h. */
+    int bx = art_x + pad;
+    int by = art_y + (line_h - sz) / 2;
+
+    if (thumb)
+    {
+        if (bx >= 0 && by >= 0 &&
+            bx + sz <= display->lcdwidth && by + sz <= display->lcdheight)
+            display->bitmap_part((const unsigned char *)thumb,
+                                 0, 0, sz, bx, by, sz, sz);
+        return;
+    }
+    if (allow_fallback && aa_fallback_sz == sz)
+    {
+        if (bx >= 0 && by >= 0 &&
+            bx + sz <= display->lcdwidth && by + sz <= display->lcdheight)
+            display->bitmap_part((const unsigned char *)aa_fallback_pixels,
+                                 0, 0, sz, bx, by, sz, sz);
+        return;
+    }
+    /* No art and no fallback: center the item icon inside the container.
+     * DRMODE_FG keeps the icon background transparent (doesn't overwrite
+     * the selection bar).  STYLE_INVERT+mono uses SOLID|INVERSEVID so the
+     * icon remains visible on an inverted selection bar, matching line.c. */
+    if (icon <= Icon_NOICON) return;
+    unsigned drmode = DRMODE_FG;
+    if (get_icon_format(display->screen_type) == FORMAT_MONO &&
+        (linedes->style & STYLE_INVERT))
+        drmode = DRMODE_SOLID | DRMODE_INVERSEVID;
+    int iw = get_icon_width(SCREEN_MAIN);
+    int ih = get_icon_height(SCREEN_MAIN);
+    int container_w = sz + 2 * pad;
+    int ix = art_x + (container_w - iw) / 2;
+    int iy = art_y + (line_h - ih) / 2;
+    display->set_drawmode(drmode);
+    screen_put_iconxy(display, ix, iy, icon);
+    display->set_drawmode(DRMODE_SOLID);
+}
+
+/* Draw item: consistent art/icon area on the left, text after it for every row. */
 static void albumart_list_draw_item(struct list_putlineinfo_t *info)
 {
-    /* Safety check: ensure we have valid list info */
     if (!info || info->line < 0 || info->line >= tc.filesindir)
     {
         gui_list_default_draw_item(info);
@@ -689,59 +1077,78 @@ static void albumart_list_draw_item(struct list_putlineinfo_t *info)
     }
 
     const int sz = aa_thumb_sz;
-    if (sz < 8)  /* theme row too small to show art */
+    if (sz < 8)
     {
         gui_list_default_draw_item(info);
         return;
     }
 
-    int saved_indent = info->item_indent;
-    bool saved_have_icons = info->have_icons;
+    struct screen *display = info->display;
+    const int line_h = info->linedes->height;
     const fb_data *thumb = aa_get(info->line);
 
-    if (thumb)
+    /* saved_indent accounts for scrollbar-left, RTL offset, and tab indentation.
+     * All art positioning must start from info->x + saved_indent, not info->x. */
+    const int saved_indent = info->item_indent;
+
+    const int pad = aa_art_pad;
+    /* Container width = sz + 2*pad.  Text gap is 4px after container + 2px before. */
+    const int container_w = sz + 2 * pad;
+
+    /* Fallback image only for items with actual associated album art:
+     * tracks (FILE_ATTR_AUDIO) and album entries (tag_album), and only for
+     * real entries — not virtual ones like [By Album], [All Tracks], [Random]
+     * which occupy the first special_entry_count slots. */
+    bool allow_fallback = (*(tc.dirfilter) == SHOW_ID3DB) &&
+        (info->line >= tc.special_entry_count) &&
+        (tagtree_get_attr(&tc) == FILE_ATTR_AUDIO ||
+         tagtree_browse_tag(&tc) == tag_album);
+
+    if (info->show_cursor)
     {
-        /* Have art: indent text to make room for thumbnail, hide icon */
-        /* 2px left pad + sz thumb + 4px gap before text */
-        info->item_indent = saved_indent + sz + 6;
-        info->have_icons = false;  /* Hide file icon when album art is present */
-        gui_list_default_draw_item(info);
-        info->item_indent = saved_indent;
-        info->have_icons = saved_have_icons;
+        /* Pointer mode: [indent][cursor][container][4px gap][text] */
+        display->put_line(info->x, info->y, info->linedes,
+            "$*s$1I$*s$*t",
+            saved_indent,
+            info->is_selected ? Icon_Cursor : Icon_NOICON,
+            container_w + 4,
+            info->item_offset, info->dsp_text);
 
-        /* Blit the decoded thumbnail */
-        struct screen *display = info->display;
-        int x  = info->x + 2;
-        int y  = info->y + 2;
-
-        /* Safety check: ensure coordinates are reasonable */
-        if (x >= 0 && y >= 0 && x + sz <= display->lcdwidth && y + sz <= display->lcdheight)
-        {
-            display->bitmap_part((const unsigned char *)thumb,
-                                 0, 0, sz,
-                                 x, y, sz, sz);
-        }
+        int art_x = info->x + saved_indent + info->icon_width - 1;
+        aa_draw_art_area(display, art_x, info->y, sz, pad, line_h,
+                         info->icon, thumb, info->linedes, allow_fallback);
     }
     else
     {
-        /* No art: draw text normally (left-aligned, no indent) */
+        /* Bar/gradient mode: [2px][container][4px gap][text] */
+        bool saved_icons = info->have_icons;
+        info->item_indent = saved_indent + container_w + 6;
+        info->have_icons  = false;
         gui_list_default_draw_item(info);
+        info->item_indent = saved_indent;
+        info->have_icons  = saved_icons;
+
+        int art_x = info->x + saved_indent + 2;
+        aa_draw_art_area(display, art_x, info->y, sz, pad, line_h,
+                         info->icon, thumb, info->linedes, allow_fallback);
     }
 
-    /* Prefetch ahead for smooth scrolling */
-    if (info->line > aa_last_drawn)
+    /* Direction detection: runs once per frame on the first visible item */
+    int cur_start = info->list->start_item[SCREEN_MAIN];
+    if (info->line == cur_start)
     {
-        /* Scrolling down - prefetch ahead */
+        if (aa_prev_start >= 0 && cur_start != aa_prev_start)
+            aa_scroll_dir = (cur_start > aa_prev_start) ? 1 : -1;
+        aa_prev_start = cur_start;
+    }
+
+    /* Direction-aware prefetch */
+    if (aa_scroll_dir >= 0)
         for (int i = 1; i <= AA_PREFETCH_AHEAD; i++)
             aa_try_prefetch(info->line + i);
-    }
-    else if (info->line < aa_last_drawn)
-    {
-        /* Scrolling up - prefetch behind */
+    if (aa_scroll_dir <= 0)
         for (int i = 1; i <= AA_PREFETCH_AHEAD; i++)
             aa_try_prefetch(info->line - i);
-    }
-    aa_last_drawn = info->line;
 }
 #endif /* HAVE_TAGCACHE */
 
@@ -767,16 +1174,38 @@ static int update_dir(void)
     /* Ensure that list is initialized before update_dir returns */
     gui_synclist_init(list, &tree_get_filename, &tc, false, 1, NULL);
 
-    /* Derive thumbnail size from theme's row height; invalidate cache if it changed */
-    int new_sz = list->line_height[SCREEN_MAIN] - 4;
-    if (new_sz > AA_THUMB) new_sz = AA_THUMB;
-    if (new_sz < 0)        new_sz = 0;
-    if (new_sz != aa_thumb_sz)
+    /* Artwork sizing (DB view only):
+     *   base_h  = configured row height — determines aa_thumb_sz
+     *   pad     = per-side padding around art inside its container
+     *   effective line height = base_h + 2*pad (row grows to fit container)
+     * In the file browser we still derive sz from the theme line height so
+     * the icon placeholder is sensibly sized, but padding stays 0.
+     * When show_album_art is off we skip all of this and use the normal
+     * draw callback — the list looks exactly like the standard view. */
+#if LCD_DEPTH > 1 && defined(HAVE_TAGCACHE)
+    const bool show_art = global_settings.show_album_art;
+#else
+    const bool show_art = false;
+#endif
     {
-        aa_invalidate();
-        aa_thumb_sz = new_sz;
+        int pad  = (id3db && show_art) ? global_settings.thumb_art_padding : 0;
+        int base_h = list->line_height[SCREEN_MAIN]; /* theme default */
+        if (id3db && show_art && global_settings.thumb_row_height > 0)
+            base_h = global_settings.thumb_row_height;
+        if (id3db && show_art)
+            FOR_NB_SCREENS(i)
+                list->line_height[i] = base_h + 2 * pad;
+
+        int new_sz = show_art ? MIN(base_h - 4, AA_THUMB) : 0;
+        if (new_sz < 0) new_sz = 0;
+        aa_art_pad = pad;
+        if (new_sz != aa_thumb_sz)
+        {
+            aa_invalidate();
+            aa_thumb_sz = new_sz;
+        }
     }
-    list->callback_draw_item = albumart_list_draw_item;
+    list->callback_draw_item = show_art ? albumart_list_draw_item : NULL;
 
 #ifdef HAVE_TAGCACHE
 
@@ -1135,6 +1564,12 @@ static int dirbrowse(void)
         oldbutton = button;
         gui_synclist_do_button(&tree_lists, &button);
         tc.selected_item = gui_synclist_get_sel_pos(&tree_lists);
+#ifdef HAVE_TAGCACHE
+        if (aa_redraw_needed) {
+            aa_redraw_needed = false;
+            gui_synclist_draw(&tree_lists);
+        }
+#endif
         int customaction = ONPLAY_NO_CUSTOMACTION;
         bool do_restore_display = true;
         #ifdef HAVE_TAGCACHE
