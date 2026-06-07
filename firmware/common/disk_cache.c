@@ -251,23 +251,29 @@ void dc_discard_buf(void *buf)
         cache_discard_entry(dce, index);
 }
 
-/* commit all dirty cache entries to storage for a specified volume */
-void dc_commit_all(IF_MV_NONVOID(int volume))
+/* commit dirty cache entries in [range_start, range_end) for a volume */
+void dc_commit_range(IF_MV(int volume,) sector_t range_start, sector_t range_end)
 {
-    DEBUGF("dc_commit_all()\n");
-
     FOR_EACH_BITARRAY_SET_BIT(&CACHE_VOL_MAP(volume), index)
     {
         struct disk_cache_entry *dce = &cache_entry[index];
         unsigned int flags = dce->flags;
 
-        if (flags & DCE_DIRTY)
+        if ((flags & DCE_DIRTY) &&
+            dce->sector >= range_start && dce->sector < range_end)
         {
             dc_writeback_callback(IF_MV(volume,) dce->sector,
                                   cache_buffer[index]);
             dce->flags = flags & ~DCE_DIRTY;
         }
     }
+}
+
+/* commit all dirty cache entries to storage for a specified volume */
+void dc_commit_all(IF_MV_NONVOID(int volume))
+{
+    DEBUGF("dc_commit_all()\n");
+    dc_commit_range(IF_MV(volume,) 0, (sector_t)-1);
 }
 
 /* discard all cache entries from the specified volume */

@@ -35,6 +35,8 @@
 #include "debug.h"
 #include "panic.h"
 #include "disk.h"
+#include "kernel.h"
+#include "thread.h"
 /*#define LOGF_ENABLE*/
 #include "logf.h"
 
@@ -338,7 +340,14 @@ static void cache_commit(struct bpb *fat_bpb)
     if (!fat_bpb->is_fat16)
 #endif
         update_fsinfo32(fat_bpb);
-    dc_commit_all(IF_MV(fat_bpb->volume));
+    /* Flush in safe order: reserved sectors, then data+dir, then FAT.
+     * Flushing data and directory entries before FAT means a crash between
+     * the two passes leaves orphaned-but-consistent clusters (lost clusters)
+     * rather than a FAT chain freed beneath a still-visible directory entry,
+     * which would cause cross-linking and silent corruption. */
+    dc_commit_range(IF_MV(fat_bpb->volume,) 0, fat_bpb->fatrgnstart);
+    dc_commit_range(IF_MV(fat_bpb->volume,) fat_bpb->fatrgnend, (sector_t)-1);
+    dc_commit_range(IF_MV(fat_bpb->volume,) fat_bpb->fatrgnstart, fat_bpb->fatrgnend);
     dc_unlock_cache();
 }
 
@@ -361,10 +370,21 @@ static void * cache_sector(struct bpb *fat_bpb, sector_t secnum)
                                       secnum + fat_bpb->startsector, 1, buf);
         if (UNLIKELY(rc < 0))
         {
-            DEBUGF("%s() - Could not read sector %llu"
-                   " (error %d)\n", __func__, (uint64_t)secnum, rc);
-            dc_discard_buf(buf);
-            return NULL;
+            if (IS_FAT_SECTOR(fat_bpb, secnum) && fat_bpb->bpb_numfats > 1)
+            {
+                sector_t fat2sec = secnum + fat_bpb->fatsize;
+                DEBUGF("%s() - FAT1 sector %llu unreadable, trying FAT2\n",
+                       __func__, (uint64_t)secnum);
+                rc = storage_read_sectors(IF_MD(fat_bpb->drive,)
+                                          fat2sec + fat_bpb->startsector, 1, buf);
+            }
+            if (rc < 0)
+            {
+                DEBUGF("%s() - Could not read sector %llu"
+                       " (error %d)\n", __func__, (uint64_t)secnum, rc);
+                dc_discard_buf(buf);
+                return NULL;
+            }
         }
     }
 
@@ -385,26 +405,37 @@ static void * cache_sector_buffer(IF_MV(struct bpb *fat_bpb,)
 void dc_writeback_callback(IF_MV(int volume,) sector_t sector, void *buf)
 {
     struct bpb * const fat_bpb = &fat_bpbs[IF_MV_VOL(volume)];
-    unsigned int copies = !IS_FAT_SECTOR(fat_bpb, sector) ?
-                                1 : fat_bpb->bpb_numfats;
+    bool is_fat = IS_FAT_SECTOR(fat_bpb, sector);
 
     sector += fat_bpb->startsector;
 
-    while (1)
+    /* For FAT sectors with mirroring, write FAT2 first so FAT1 stays the
+     * last-known-good copy if power fails between the two writes (TFAT
+     * semantics: stable copy is never overwritten until the working copy
+     * is safely committed). */
+    if (is_fat && fat_bpb->bpb_numfats > 1)
     {
-        int rc = storage_write_sectors(IF_MD(fat_bpb->drive,) sector, 1, buf);
-        if (rc < 0)
+        sector_t fat2 = sector + fat_bpb->fatsize;
+        int rc = -1;
+        for (int i = 0; i < 3 && rc < 0; i++)
         {
-            panicf("%s() - Could not write sector %llu"
-                   " (error %d)\n", __func__, (uint64_t)sector, rc);
+            rc = storage_write_sectors(IF_MD(fat_bpb->drive,) fat2, 1, buf);
+            if (rc < 0) sleep(1);
         }
-
-        if (--copies == 0)
-            break;
-
-        /* Update next FAT */
-        sector += fat_bpb->fatsize;
+        if (rc < 0)
+            panicf("%s() - Could not write sector %llu (error %d)\n",
+                   __func__, (uint64_t)fat2, rc);
     }
+
+    int rc = -1;
+    for (int i = 0; i < 3 && rc < 0; i++)
+    {
+        rc = storage_write_sectors(IF_MD(fat_bpb->drive,) sector, 1, buf);
+        if (rc < 0) sleep(1);
+    }
+    if (rc < 0)
+        panicf("%s() - Could not write sector %llu (error %d)\n",
+               __func__, (uint64_t)sector, rc);
 }
 
 static void raw_dirent_set_fstclus(union raw_dirent *ent, long fstclus)
