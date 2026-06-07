@@ -39,6 +39,7 @@ void * dc_cache_probe(IF_MV(int volume,) sector_t secnum,
                       unsigned int *flags);
 void dc_dirty_buf(void *buf);
 void dc_discard_buf(void *buf);
+void dc_commit_range(IF_MV(int volume,) sector_t range_start, sector_t range_end);
 void dc_commit_all(IF_MV_NONVOID(int volume));
 void dc_discard_all(IF_MV_NONVOID(int volume));
 
