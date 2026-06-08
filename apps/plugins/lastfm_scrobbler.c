@@ -103,6 +103,7 @@ Example
 #define SCROBBLER_LOG_OK (PLUGIN_OK + 2)
 #define SCROBBLER_LOG_NOMETADATA (PLUGIN_OK + 3)
 #define SCROBBLER_LOG_SKIPTRACK  (PLUGIN_OK + 4)
+#define SCROBBLER_LOG_IGNORED    (PLUGIN_OK + 5)
 #define SCROBBLER_LOG_ERROR (PLUGIN_ERROR)
 
 #if CONFIG_RTC
@@ -417,6 +418,53 @@ static inline const char* str_chk_valid(char *s, const char *alt)
     return s;
 }
 
+static bool sbl_path_db_ignored(const char *path)
+{
+    /* Mirrors tagcache's check_ignore()/check_dir() database.ignore and
+     * database.unignore handling -- a directory's ignore state is
+     * inherited by its subdirectories unless overridden by the opposite
+     * marker file in that subdirectory. Walk from the root down to the
+     * directory containing 'path' applying the same rule, so files that
+     * the database scanner would skip are also skipped for scrobbling. */
+    char dir[MAX_PATH];
+    char marker[MAX_PATH];
+    bool add_files = true; /* matches the default at the search root */
+
+    const char *fname = rb->strrchr(path, '/');
+    if (!fname)
+        return false; /* no directory component -- nothing to check */
+
+    size_t len = fname - path;
+    if (len == 0)
+        len = 1; /* keep the leading '/' to check the root directory itself */
+    if (len >= sizeof(dir))
+        len = sizeof(dir) - 1;
+    rb->memcpy(dir, path, len);
+    dir[len] = '\0';
+
+    for (char *p = dir; ; )
+    {
+        char *sep = rb->strchr(p + 1, '/');
+        if (sep)
+            *sep = '\0';
+
+        rb->snprintf(marker, sizeof(marker), "%s/database.ignore", dir);
+        bool ignore = rb->file_exists(marker);
+        rb->snprintf(marker, sizeof(marker), "%s/database.unignore", dir);
+        bool unignore = rb->file_exists(marker);
+
+        if (ignore != unignore)
+            add_files = unignore;
+
+        if (!sep)
+            break;
+        *sep = '/';
+        p = sep;
+    }
+
+    return !add_files;
+}
+
 static unsigned long sbl_get_threshold(unsigned long length_ms)
 {
     /* length is assumed to be in miliseconds */
@@ -450,6 +498,12 @@ static int sbl_create_entry(struct scrobbler_entry *entry, int output_fd)
 
     if (output_fd < 0)
         return SCROBBLER_LOG_ERROR;
+
+    /* honor database.ignore / database.unignore the same way the
+     * database scanner does -- don't scrobble tracks that live in a
+     * directory tree excluded from the database */
+    if (sbl_path_db_ignored(entry->path))
+        return SCROBBLER_LOG_IGNORED;
 
     /* if we are saving filename only then we don't need metadata */
     if (gConfig.tracknfo == 2 || !rb->get_metadata(&id3, -1, entry->path))
@@ -945,6 +999,8 @@ static int sbl_export(void)
                     missing_meta++;
                     continue;
                 }
+                if (ret == SCROBBLER_LOG_IGNORED)
+                    continue;
                 if (ret == SCROBBLER_LOG_NOMETADATA)
                     missing_meta++;
 
