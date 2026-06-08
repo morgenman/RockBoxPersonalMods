@@ -483,7 +483,21 @@ static void aa_invalidate(void)
     mutex_unlock(&aa_mutex);
 }
 
-/* Resolve item_idx → album_name for use as the cache key.
+/* True if name is a "no value for this tag" placeholder rather than a real
+ * album: either the raw tagcache sentinel ("<Untagged>", stored verbatim in
+ * a track's album_name) or the localized [Untagged] display string (used as
+ * the entry name when browsing albums). Such groupings have no consistent
+ * artwork, so they're treated the same as non-album/non-track items. */
+static bool aa_name_is_untagged(const char *name)
+{
+    return name && name[0] &&
+           (strcmp(name, UNTAGGED) == 0 ||
+            strcmp(name, (const char *)str(LANG_TAGNAVI_UNTAGGED)) == 0);
+}
+
+/* Resolve item_idx → album_name for use as the cache key. Returns true only
+ * for items that represent a real album or a real track with album info —
+ * i.e. items eligible for cached art and the fallback image alike.
  * Only looks up the name from the in-memory tagtree buffer — no tagcache
  * searches, so this is safe and fast to call from the draw callback.
  * track_path is left empty; the full tagcache lookup happens only in the
@@ -519,6 +533,10 @@ static bool aa_resolve_path(int item_idx, char *track_path, char *album_name)
         if (!tagtree_get_entry_name(&tc, item_idx, album_name, MAX_PATH))
             return false;
     }
+
+    if (aa_name_is_untagged(album_name))
+        return false;
+
     return true;
 }
 
@@ -1095,14 +1113,13 @@ static void albumart_list_draw_item(struct list_putlineinfo_t *info)
     /* Container width = sz + 2*pad.  Text gap is 4px after container + 2px before. */
     const int container_w = sz + 2 * pad;
 
-    /* Fallback image only for items with actual associated album art:
-     * tracks (FILE_ATTR_AUDIO) and album entries (tag_album), and only for
-     * real entries — not virtual ones like [By Album], [All Tracks], [Random]
-     * which occupy the first special_entry_count slots. */
-    bool allow_fallback = (*(tc.dirfilter) == SHOW_ID3DB) &&
-        (info->line >= tc.special_entry_count) &&
-        (tagtree_get_attr(&tc) == FILE_ATTR_AUDIO ||
-         tagtree_browse_tag(&tc) == tag_album);
+    /* Fallback image only for items that aa_resolve_path recognises as a
+     * genuine album or track — this is the same eligibility test used to pick
+     * the art cache key, so menus, [By Album]/[All Tracks]/[Random], and
+     * [Untagged] groupings never show it, only real albums/tracks do. */
+    char fb_scratch_path[MAX_PATH];
+    char fb_scratch_album[MAX_PATH];
+    bool allow_fallback = aa_resolve_path(info->line, fb_scratch_path, fb_scratch_album);
 
     if (info->show_cursor)
     {
