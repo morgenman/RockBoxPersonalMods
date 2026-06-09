@@ -2008,6 +2008,9 @@ static bool dbg_tagcache_info(void)
 
 /* --- Album Art Thumbnail debug submenu ----------------------------------- */
 
+static const int aa_dbg_sizes[] = {16,20,24,28,32,36,40,44,64,96,128};
+static int aa_dbg_cached_counts[sizeof(aa_dbg_sizes)/sizeof(aa_dbg_sizes[0])];
+
 static int aa_dbg_count_cached(int sz)
 {
     char dir[MAX_PATH];
@@ -2020,6 +2023,12 @@ static int aa_dbg_count_cached(int sz)
         if (de->d_name[0] == 't') count++;
     closedir(d);
     return count;
+}
+
+static void aa_dbg_refresh_counts(void)
+{
+    for (unsigned i = 0; i < sizeof(aa_dbg_sizes)/sizeof(aa_dbg_sizes[0]); i++)
+        aa_dbg_cached_counts[i] = aa_dbg_count_cached(aa_dbg_sizes[i]);
 }
 
 /* Cached total album count — persists across re-entries so we don't re-scan
@@ -2047,6 +2056,11 @@ static int aa_dbg_report_callback(int btn, struct gui_synclist *lists)
 {
     (void)lists;
     const struct aa_build_stat *stat = aa_get_build_stat();
+    static bool was_active = false;
+
+    if (was_active && !stat->active)
+        aa_dbg_refresh_counts();
+    was_active = stat->active;
 
     simplelist_reset_lines();
 
@@ -2068,16 +2082,16 @@ static int aa_dbg_report_callback(int btn, struct gui_synclist *lists)
 
     simplelist_addline(" ");
     int total = aa_dbg_count_albums();
-    static const int sizes[] = {16,20,24,28,32,36,40,44,64,96,128};
-    for (unsigned i = 0; i < sizeof(sizes)/sizeof(sizes[0]); i++)
+    for (unsigned i = 0; i < sizeof(aa_dbg_sizes)/sizeof(aa_dbg_sizes[0]); i++)
     {
-        int cached = aa_dbg_count_cached(sizes[i]);
         if (total > 0)
             simplelist_addline("%3dpx (row %3dpx): %d/%d",
-                               sizes[i], sizes[i]+4, cached, total);
+                               aa_dbg_sizes[i], aa_dbg_sizes[i]+4,
+                               aa_dbg_cached_counts[i], total);
         else
             simplelist_addline("%3dpx (row %3dpx): %d cached",
-                               sizes[i], sizes[i]+4, cached);
+                               aa_dbg_sizes[i], aa_dbg_sizes[i]+4,
+                               aa_dbg_cached_counts[i]);
     }
 
     if (!btn && stat->active)
@@ -2088,6 +2102,7 @@ static int aa_dbg_report_callback(int btn, struct gui_synclist *lists)
 
 static bool aa_dbg_show_report(void)
 {
+    aa_dbg_refresh_counts();
     struct simplelist_info info;
     simplelist_info_init(&info, "AA Thumbnails — Report", 0, NULL);
     info.action_callback = aa_dbg_report_callback;
