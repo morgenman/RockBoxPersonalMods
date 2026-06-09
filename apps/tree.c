@@ -409,15 +409,21 @@ static int tree_get_file_position(char * filename)
 }
 
 #ifdef HAVE_TAGCACHE
-#define AA_THUMB            44   /* max decoded thumbnail size (buffer ceiling) */
+#define AA_THUMB            128  /* max decoded thumbnail size (buffer ceiling) */
 #define AA_SLOTS            32   /* LRU cache slots */
 #define AA_PREFETCH_AHEAD   5    /* items to prefetch in the scroll direction */
 #define AA_THUMBCACHE_DIR   ROCKBOX_DIR "/thumbcache"
 
+/* Standard art sizes matching the menu options table */
+static const int aa_standard_sizes[] = {16,20,24,28,32,36,40,44,64,96,128};
+#define AA_NUM_STD_SIZES ((int)(sizeof(aa_standard_sizes)/sizeof(aa_standard_sizes[0])))
+
 /* Decode-thread message IDs */
-#define AA_Q_DECODE  1
-#define AA_Q_QUIT    2
-#define AA_Q_REFRESH 3
+#define AA_Q_DECODE      1
+#define AA_Q_QUIT        2
+#define AA_Q_REFRESH     3
+#define AA_Q_REFRESH_ALL 4
+#define AA_Q_PRUNE       5
 
 typedef struct {
     int  item_idx;                  /* -1 = unused */
@@ -444,13 +450,18 @@ static struct event_queue aa_queue;
 static long               aa_thread_stack[(DEFAULT_STACK_SIZE + 0x2000) / sizeof(long)];
 static unsigned int       aa_thread_id = 0;
 static volatile bool      aa_redraw_needed = false;
-static volatile bool      aa_pending_refresh = false; /* set by user action; gates startup */
-static aa_entry_t         aa_gen_slot; /* reusable slot for bulk thumb generation */
+static volatile bool      aa_build_stop    = false; /* set by aa_thumbcache_build_stop() */
+static aa_entry_t         aa_gen_slot;              /* reusable slot for bulk thumb generation */
+
+/* Live build progress — updated by decode thread, read by UI thread (no lock needed;
+ * values are informational and short-tearing is harmless).
+ * struct aa_build_stat is declared in tree.h. */
+static struct aa_build_stat aa_bstat;
 
 /* Fallback image: theme-supplied BMP drawn for items with no art.
  * Source path comes from global_settings.thumb_fallback_file (theme-configurable).
- * A scaled .bin is cached in thumbcache, keyed on CRC32(path) + size. */
-#define AA_FALLBACK_CACHE_FMT  AA_THUMBCACHE_DIR "/fallback_%08x_%d.bin"
+ * A scaled .bin is cached in thumbcache/%dp/, keyed on CRC32(path). */
+#define AA_FALLBACK_CACHE_FMT  AA_THUMBCACHE_DIR "/%dp/fallback_%08x.bin"
 static fb_data           aa_fallback_pixels[AA_THUMB * AA_THUMB];
 static volatile int      aa_fallback_sz  = 0; /* 0 = not loaded; set by decode thread */
 static volatile uint32_t aa_fallback_crc = 0; /* CRC32 of the loaded source path */
@@ -540,18 +551,26 @@ static bool aa_resolve_path(int item_idx, char *track_path, char *album_name)
     return true;
 }
 
-/* Build the disk-cache path keyed on the album name and thumb size. */
+/* Ensure the per-size subdirectory exists (no-op if already present). */
+static void aa_ensure_size_dir(int sz)
+{
+    char dir[MAX_PATH];
+    snprintf(dir, sizeof(dir), AA_THUMBCACHE_DIR "/%dp", sz);
+    mkdir(dir);
+}
+
+/* Build the disk-cache path keyed on the album name; thumbs live in Np/ subdirs. */
 static void aa_thumb_cache_path(char *buf, const char *album_name, int sz)
 {
     uint32_t hash = crc_32(album_name, strlen(album_name), 0xffffffff);
-    snprintf(buf, MAX_PATH, AA_THUMBCACHE_DIR "/t%08x_%d.bin",
-             (unsigned)hash, sz);
+    snprintf(buf, MAX_PATH, AA_THUMBCACHE_DIR "/%dp/t%08x.bin",
+             sz, (unsigned)hash);
 }
 
 static void aa_fallback_cache_path(char *buf, const char *source_path, int sz)
 {
     uint32_t hash = crc_32(source_path, strlen(source_path), 0xffffffff);
-    snprintf(buf, MAX_PATH, AA_FALLBACK_CACHE_FMT, (unsigned)hash, sz);
+    snprintf(buf, MAX_PATH, AA_FALLBACK_CACHE_FMT, sz, (unsigned)hash);
 }
 
 /* Read a pre-built thumbnail from the disk cache into slot->pixels.
@@ -663,6 +682,7 @@ static bool aa_generate_to_slot(aa_entry_t *slot, int thumb_sz)
 
     if (bm.width == thumb_sz && bm.height == thumb_sz)
     {
+        aa_ensure_size_dir(thumb_sz);
         int wfd = open(cache_path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
         if (wfd >= 0)
         {
@@ -674,21 +694,38 @@ static bool aa_generate_to_slot(aa_entry_t *slot, int thumb_sz)
     return true;
 }
 
-/* Delete every file in the thumbcache dir. Called from the main thread before
- * a full DB rebuild so orphan files don't survive the regeneration pass. */
+/* Delete every file in every Np/ subdir of the thumbcache (and the subdirs
+ * themselves).  Plain files at the top level are also removed for safety. */
 void aa_thumbcache_clear(void)
 {
-    DIR *dir = opendir(AA_THUMBCACHE_DIR);
-    if (!dir) return;
+    DIR *topdir = opendir(AA_THUMBCACHE_DIR);
+    if (!topdir) return;
     struct dirent *de;
     char path[MAX_PATH];
-    while ((de = readdir(dir)) != NULL)
+    while ((de = readdir(topdir)) != NULL)
     {
         if (de->d_name[0] == '.') continue;
         snprintf(path, MAX_PATH, AA_THUMBCACHE_DIR "/%s", de->d_name);
-        remove(path);
+        DIR *subdir = opendir(path);
+        if (subdir)
+        {
+            struct dirent *sde;
+            char subpath[MAX_PATH];
+            while ((sde = readdir(subdir)) != NULL)
+            {
+                if (sde->d_name[0] == '.') continue;
+                snprintf(subpath, sizeof(subpath), "%s/%s", path, sde->d_name);
+                remove(subpath);
+            }
+            closedir(subdir);
+            rmdir(path);
+        }
+        else
+        {
+            remove(path);
+        }
     }
-    closedir(dir);
+    closedir(topdir);
 }
 
 /* Decode the BMP at source_path, scale to sz, and write a .bin to thumbcache.
@@ -717,6 +754,7 @@ static void aa_build_fallback_cache(const char *source_path, int sz)
                            FORMAT_NATIVE | FORMAT_RESIZE, NULL);
     if (rc < 0 || bm.width != sz || bm.height != sz) return;
 
+    aa_ensure_size_dir(sz);
     int wfd = open(cache_path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
     if (wfd >= 0)
     {
@@ -767,19 +805,25 @@ static void aa_load_fallback(int thumb_sz)
     if (ok) { aa_fallback_sz = thumb_sz; aa_fallback_crc = path_crc; }
 }
 
-/* Generate exactly one disk-cached thumb per album.
- * Iterates unique album names; for each finds the representative track using
- * the same query the browse view uses (folder image first, embedded fallback).
- * Runs in the decode thread; yields between albums. */
-static void aa_build_thumbcache(void)
+/* Return the effective art size: explicit user setting > theme hint > live value. */
+static int aa_effective_size(void)
 {
-    /* If a row height override is active, compute the size directly from the
-     * setting — aa_thumb_sz may be stale if the browser hasn't been opened
-     * since the setting was changed. */
-    int sz = (global_settings.thumb_row_height > 0)
-             ? MIN(global_settings.thumb_row_height - 4, AA_THUMB)
-             : aa_thumb_sz;
+    if (global_settings.thumb_art_size > 0)
+        return MIN(global_settings.thumb_art_size, AA_THUMB);
+    if (global_settings.thumb_theme_size > 0)
+        return MIN(global_settings.thumb_theme_size, AA_THUMB);
+    return aa_thumb_sz;
+}
+
+/* Generate thumbnails for all albums at a single explicit size.
+ * Runs in the decode thread; updates aa_bstat; honours aa_build_stop. */
+static void aa_build_thumbcache_at_sz(int sz)
+{
     if (sz < 8 || !tagcache_is_usable()) return;
+
+    aa_ensure_size_dir(sz);
+    aa_bstat.current_sz = sz;
+    aa_bstat.processed  = 0;
 
     struct tagcache_search tcs;
     if (!tagcache_search(&tcs, tag_album))
@@ -789,15 +833,17 @@ static void aa_build_thumbcache(void)
 
     while (tagcache_get_next(&tcs, aa_gen_slot.album_name, MAX_PATH))
     {
-        /* De-duplicate consecutive identical album names */
+        if (aa_build_stop) break;
+
         if (strcmp(aa_gen_slot.album_name, prev_album) == 0)
         {
             yield();
             continue;
         }
         strmemccpy(prev_album, aa_gen_slot.album_name, MAX_PATH);
+        strmemccpy(aa_bstat.current_album, aa_gen_slot.album_name,
+                   sizeof(aa_bstat.current_album));
 
-        /* Find the representative track for this album (same query as browse) */
         struct tagcache_search tcs2;
         struct tagcache_search_clause clause;
         memset(&clause, 0, sizeof(clause));
@@ -817,35 +863,153 @@ static void aa_build_thumbcache(void)
 
         if (!aa_gen_slot.track_path[0]) { yield(); continue; }
 
-        /* generate (or skip if already cached); find_albumart tries folder
-         * images first, then we fall back to embedded art if not found */
         aa_generate_to_slot(&aa_gen_slot, sz);
+        aa_bstat.processed++;
         yield();
     }
     tagcache_search_finish(&tcs);
 
-    /* Generate the fallback .bin for the currently configured fallback image */
+    /* Generate fallback .bin for this size */
     const char *fb_path = (const char *)global_settings.thumb_fallback_file;
-    if (fb_path[0])
+    if (fb_path[0] && !aa_build_stop)
     {
         int bfd = open(fb_path, O_RDONLY);
         if (bfd >= 0) { close(bfd); aa_build_fallback_cache(fb_path, sz); }
     }
 }
 
-/* Called from the tagcache commit callback. Only posts a refresh job when the
- * user explicitly triggered a DB operation (not on every startup). */
-static void aa_on_db_commit(void)
+/* Build at the currently active/configured size. */
+static void aa_build_thumbcache(void)
 {
-    if (!aa_pending_refresh) return;
-    aa_pending_refresh = false;
+    int sz = aa_effective_size();
+    if (sz < 8) return;
+    aa_build_stop      = false;
+    aa_bstat.active    = true;
+    aa_bstat.all_sizes = false;
+    aa_build_thumbcache_at_sz(sz);
+    aa_bstat.active = false;
+    aa_bstat.current_album[0] = '\0';
+}
+
+/* Build at every standard size in sequence. */
+static void aa_build_all_sizes(void)
+{
+    aa_build_stop      = false;
+    aa_bstat.active    = true;
+    aa_bstat.all_sizes = true;
+    for (int i = 0; i < AA_NUM_STD_SIZES && !aa_build_stop; i++)
+        aa_build_thumbcache_at_sz(aa_standard_sizes[i]);
+    aa_bstat.active = false;
+    aa_bstat.current_album[0] = '\0';
+}
+
+/* Public: post a single-size build to the decode thread. */
+void aa_thumbcache_build_start(void)
+{
+    aa_build_stop = false;
     queue_post(&aa_queue, AA_Q_REFRESH, 0);
 }
 
-/* Schedule a thumb cache rebuild after the next tagcache commit. */
-void aa_thumbcache_refresh(void)
+/* Public: post an all-sizes build to the decode thread. */
+void aa_thumbcache_build_all_start(void)
 {
-    aa_pending_refresh = true;
+    aa_build_stop = false;
+    queue_post(&aa_queue, AA_Q_REFRESH_ALL, 0);
+}
+
+/* Public: cancel the current build (checked per album in the build loop). */
+void aa_thumbcache_build_stop(void)
+{
+    aa_build_stop = true;
+}
+
+/* Public: read-only pointer to live build progress (informational; no lock). */
+const struct aa_build_stat *aa_get_build_stat(void)
+{
+    return &aa_bstat;
+}
+
+/* --- Orphan prune --------------------------------------------------------
+ * Remove .bin files in the thumbcache whose album is no longer in the DB.
+ * Runs in the decode thread.  Uses a temporary sorted array of valid CRC32
+ * hashes; skips pruning if the allocation fails. */
+static int aa_cmp_u32(const void *a, const void *b)
+{
+    uint32_t ua = *(const uint32_t*)a, ub = *(const uint32_t*)b;
+    return (ua > ub) - (ua < ub);
+}
+
+static void _aa_do_prune(void)
+{
+    if (!tagcache_is_usable()) return;
+
+    /* Phase 1: collect valid album hashes */
+    const int max_albums = 8192;
+    int handle = core_alloc((size_t)max_albums * sizeof(uint32_t));
+    if (handle < 0) return;
+    uint32_t *valid = core_get_data(handle);
+    int n_valid = 0;
+
+    struct tagcache_search tcs;
+    if (tagcache_search(&tcs, tag_album))
+    {
+        char album_name[MAX_PATH];
+        char prev[MAX_PATH] = "";
+        while (tagcache_get_next(&tcs, album_name, MAX_PATH) && n_valid < max_albums)
+        {
+            if (strcmp(album_name, prev) == 0) { yield(); continue; }
+            strmemccpy(prev, album_name, MAX_PATH);
+            valid[n_valid++] = crc_32(album_name, strlen(album_name), 0xffffffff);
+            yield();
+        }
+        tagcache_search_finish(&tcs);
+    }
+    qsort(valid, (size_t)n_valid, sizeof(uint32_t), aa_cmp_u32);
+
+    /* Phase 2: scan every Np/ subdir; delete .bin files not in valid set */
+    for (int i = 0; i < AA_NUM_STD_SIZES; i++)
+    {
+        if (aa_build_stop) break;
+        char dir[MAX_PATH];
+        snprintf(dir, sizeof(dir), AA_THUMBCACHE_DIR "/%dp", aa_standard_sizes[i]);
+        DIR *d = opendir(dir);
+        if (!d) continue;
+        struct dirent *de;
+        while ((de = readdir(d)) != NULL)
+        {
+            if (de->d_name[0] != 't') continue;
+            unsigned hash_val;
+            if (sscanf(de->d_name + 1, "%08x", &hash_val) != 1) continue;
+            uint32_t hash = (uint32_t)hash_val;
+            /* Binary search in sorted valid[] for hash */
+            bool found = false;
+            {
+                int lo = 0, hi = n_valid - 1;
+                while (lo <= hi) {
+                    int mid = lo + (hi - lo) / 2;
+                    if (valid[mid] == hash)      { found = true; break; }
+                    else if (valid[mid] < hash)    lo = mid + 1;
+                    else                           hi = mid - 1;
+                }
+            }
+            if (!found)
+            {
+                char path[MAX_PATH];
+                snprintf(path, sizeof(path), "%s/%s", dir, de->d_name);
+                remove(path);
+            }
+            yield();
+        }
+        closedir(d);
+    }
+
+    core_free(handle);
+}
+
+/* Public: post a prune job to the decode thread. */
+void aa_thumbcache_prune(void)
+{
+    queue_post(&aa_queue, AA_Q_PRUNE, 0);
 }
 
 /* Background decode thread: waits for requests, decodes, writes result to cache. */
@@ -855,12 +1019,15 @@ static void aa_decode_thread(void)
     while (1)
     {
         queue_wait(&aa_queue, &ev);
-        if (ev.id == AA_Q_QUIT) break;
-        if (ev.id == AA_Q_REFRESH) { aa_build_thumbcache(); continue; }
+        if (ev.id == AA_Q_QUIT)        break;
+        if (ev.id == AA_Q_REFRESH)     { aa_build_thumbcache();  continue; }
+        if (ev.id == AA_Q_REFRESH_ALL) { aa_build_all_sizes();   continue; }
+        if (ev.id == AA_Q_PRUNE)       { _aa_do_prune();         continue; }
         if (ev.id != AA_Q_DECODE) continue;
 
         int item_idx = (int)ev.data;
-        int thumb_sz = aa_thumb_sz;
+        int thumb_sz = aa_effective_size();
+        if (thumb_sz < 8) thumb_sz = aa_thumb_sz;
 
         /* Reload fallback if size or configured source path changed */
         {
@@ -1029,7 +1196,6 @@ static void aa_thread_init(void)
     queue_init(&aa_queue, false);
     _aa_do_invalidate();
     mkdir(AA_THUMBCACHE_DIR); /* no-op if already exists */
-    tagcache_set_commit_callback(aa_on_db_commit);
     aa_thread_id = create_thread(aa_decode_thread, aa_thread_stack,
                                  sizeof(aa_thread_stack), 0,
                                  "aa_decode" IF_PRIO(, PRIORITY_BACKGROUND)
@@ -1192,11 +1358,11 @@ static int update_dir(void)
     gui_synclist_init(list, &tree_get_filename, &tc, false, 1, NULL);
 
     /* Artwork sizing (DB view only):
-     *   base_h  = configured row height — determines aa_thumb_sz
-     *   pad     = per-side padding around art inside its container
+     *   art_sz  = thumbnail pixel size (what the user/theme actually set)
+     *   base_h  = art_sz + 4  (row height = art + 2px top/bottom margin)
      *   effective line height = base_h + 2*pad (row grows to fit container)
-     * In the file browser we still derive sz from the theme line height so
-     * the icon placeholder is sensibly sized, but padding stays 0.
+     *
+     * Priority: explicit user size > theme hint (when auto) > font-derived auto.
      * When show_album_art is off we skip all of this and use the normal
      * draw callback — the list looks exactly like the standard view. */
 #if LCD_DEPTH > 1 && defined(HAVE_TAGCACHE)
@@ -1205,15 +1371,30 @@ static int update_dir(void)
     const bool show_art = false;
 #endif
     {
-        int pad  = (id3db && show_art) ? global_settings.thumb_art_padding : 0;
-        int base_h = list->line_height[SCREEN_MAIN]; /* theme default */
-        if (id3db && show_art && global_settings.thumb_row_height > 0)
-            base_h = global_settings.thumb_row_height;
+        int pad = (id3db && show_art) ? global_settings.thumb_art_padding : 0;
+
+        int art_sz, base_h;
+        if (id3db && show_art && global_settings.thumb_art_size > 0)
+        {
+            art_sz = MIN(global_settings.thumb_art_size, AA_THUMB);
+            base_h = art_sz + 4;
+        }
+        else if (id3db && show_art && global_settings.thumb_theme_size > 0)
+        {
+            art_sz = MIN(global_settings.thumb_theme_size, AA_THUMB);
+            base_h = art_sz + 4;
+        }
+        else
+        {
+            base_h = list->line_height[SCREEN_MAIN]; /* theme default */
+            art_sz = (base_h > 4) ? MIN(base_h - 4, AA_THUMB) : 0;
+        }
+
         if (id3db && show_art)
             FOR_NB_SCREENS(i)
                 list->line_height[i] = base_h + 2 * pad;
 
-        int new_sz = show_art ? MIN(base_h - 4, AA_THUMB) : 0;
+        int new_sz = show_art ? art_sz : 0;
         if (new_sz < 0) new_sz = 0;
         aa_art_pad = pad;
         if (new_sz != aa_thumb_sz)

@@ -123,10 +123,27 @@ void tree_lock_cache(struct tree_context *t);
 void tree_unlock_cache(struct tree_context *t);
 
 #ifdef HAVE_TAGCACHE
-/* Delete all files in the thumbnail cache directory (call before a full DB rebuild). */
+/* Delete all files in every per-size subdirectory of the thumbnail cache. */
 void aa_thumbcache_clear(void);
-/* Schedule thumb generation after the next tagcache commit completes. */
-void aa_thumbcache_refresh(void);
+
+/* Live build progress (informational; values may tear on reads — acceptable). */
+struct aa_build_stat {
+    bool active;
+    bool all_sizes;   /* true when building all standard sizes */
+    int  processed;
+    int  current_sz;
+    char current_album[MAX_PATH];
+};
+const struct aa_build_stat *aa_get_build_stat(void);
+
+/* Post a single-size build to the decode thread. */
+void aa_thumbcache_build_start(void);
+/* Post an all-sizes build to the decode thread. */
+void aa_thumbcache_build_all_start(void);
+/* Cancel the current build (checked per album in the build loop). */
+void aa_thumbcache_build_stop(void);
+/* Post an orphan-prune job to the decode thread. */
+void aa_thumbcache_prune(void);
 #endif
 
 #ifdef WIN32

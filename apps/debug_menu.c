@@ -48,6 +48,7 @@
 #include "viewport.h"
 #ifdef HAVE_TAGCACHE
 #include "tagcache.h"
+#include "tree.h"
 #endif
 #ifdef HAVE_REMOTE_LCD
 #include "lcd-remote.h"
@@ -2004,6 +2005,142 @@ static bool dbg_tagcache_info(void)
     tagcache_screensync_enable(true);
     return simplelist_show_list(&info);
 }
+
+/* --- Album Art Thumbnail debug submenu ----------------------------------- */
+
+static int aa_dbg_count_cached(int sz)
+{
+    char dir[MAX_PATH];
+    snprintf(dir, sizeof(dir), ROCKBOX_DIR "/thumbcache/%dp", sz);
+    DIR *d = opendir(dir);
+    if (!d) return 0;
+    int count = 0;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL)
+        if (de->d_name[0] == 't') count++;
+    closedir(d);
+    return count;
+}
+
+/* Cached total album count — persists across re-entries so we don't re-scan
+ * on every open. Reset to 0 only when db is known to have changed. */
+static int aa_dbg_total_albums = 0;
+
+static int aa_dbg_count_albums(void)
+{
+    if (aa_dbg_total_albums > 0) return aa_dbg_total_albums;
+    if (!tagcache_is_usable()) return 0;
+    struct tagcache_search tcs;
+    if (!tagcache_search(&tcs, tag_album)) return 0;
+    char name[MAX_PATH], prev[MAX_PATH] = "";
+    int n = 0;
+    while (tagcache_get_next(&tcs, name, MAX_PATH))
+        if (strcmp(name, prev) != 0) { n++; strmemccpy(prev, name, MAX_PATH); }
+    tagcache_search_finish(&tcs);
+    aa_dbg_total_albums = n;
+    return n;
+}
+
+/* Live progress screen — shows running status and per-size cache report.
+ * Returned to directly when a build is already active. */
+static int aa_dbg_report_callback(int btn, struct gui_synclist *lists)
+{
+    (void)lists;
+    const struct aa_build_stat *stat = aa_get_build_stat();
+
+    simplelist_reset_lines();
+
+    if (stat->active)
+    {
+        if (stat->all_sizes)
+            simplelist_addline("Generating all sizes...");
+        else
+            simplelist_addline("Generating %dpx (row %dpx)...",
+                               stat->current_sz, stat->current_sz + 4);
+        simplelist_addline("  %d albums done", stat->processed);
+        if (stat->current_album[0])
+            simplelist_addline("  %.48s", stat->current_album);
+    }
+    else
+    {
+        simplelist_addline("Idle");
+    }
+
+    simplelist_addline(" ");
+    int total = aa_dbg_count_albums();
+    static const int sizes[] = {16,20,24,28,32,36,40,44,64,96,128};
+    for (unsigned i = 0; i < sizeof(sizes)/sizeof(sizes[0]); i++)
+    {
+        int cached = aa_dbg_count_cached(sizes[i]);
+        if (total > 0)
+            simplelist_addline("%3dpx (row %3dpx): %d/%d",
+                               sizes[i], sizes[i]+4, cached, total);
+        else
+            simplelist_addline("%3dpx (row %3dpx): %d cached",
+                               sizes[i], sizes[i]+4, cached);
+    }
+
+    if (!btn && stat->active)
+        return ACTION_REDRAW;
+
+    return btn;
+}
+
+static bool aa_dbg_show_report(void)
+{
+    struct simplelist_info info;
+    simplelist_info_init(&info, "AA Thumbnails — Report", 0, NULL);
+    info.action_callback = aa_dbg_report_callback;
+    info.scroll_all = true;
+    info.timeout = 1;
+    return simplelist_show_list(&info);
+}
+
+static bool aa_dbg_build_current(void)
+{
+    aa_thumbcache_build_start();
+    return aa_dbg_show_report();
+}
+
+static bool aa_dbg_build_all(void)
+{
+    aa_thumbcache_build_all_start();
+    return aa_dbg_show_report();
+}
+
+static bool aa_dbg_stop(void)
+{
+    aa_thumbcache_build_stop();
+    return false;
+}
+
+static bool aa_dbg_prune(void)
+{
+    aa_thumbcache_prune();
+    return aa_dbg_show_report();
+}
+
+MENUITEM_FUNCTION(aa_dbg_report_item, 0, "View Progress / Report",
+                  aa_dbg_show_report, NULL, Icon_NOICON);
+MENUITEM_FUNCTION(aa_dbg_build_item, 0, "Build Current Size",
+                  aa_dbg_build_current, NULL, Icon_NOICON);
+MENUITEM_FUNCTION(aa_dbg_all_item, 0, "Build All Sizes",
+                  aa_dbg_build_all, NULL, Icon_NOICON);
+MENUITEM_FUNCTION(aa_dbg_stop_item, 0, "Stop Processing",
+                  aa_dbg_stop, NULL, Icon_NOICON);
+MENUITEM_FUNCTION(aa_dbg_prune_item, 0, "Remove Orphan Thumbs",
+                  aa_dbg_prune, NULL, Icon_NOICON);
+MAKE_MENU(aa_dbg_menu, "Album Art Thumbnails", NULL, Icon_NOICON,
+          &aa_dbg_report_item, &aa_dbg_build_item, &aa_dbg_all_item,
+          &aa_dbg_stop_item, &aa_dbg_prune_item);
+
+static bool dbg_aa_thumbs(void)
+{
+    /* Jump straight to the report screen if a build is already running */
+    if (aa_get_build_stat()->active)
+        return aa_dbg_show_report();
+    return do_menu(&aa_dbg_menu, NULL, NULL, false) == MENU_ATTACHED_USB;
+}
 #endif
 
 #if defined CPU_COLDFIRE
@@ -2898,6 +3035,7 @@ static const struct {
 #endif
 #ifdef HAVE_TAGCACHE
         { "View database info", dbg_tagcache_info },
+        { "Album Art Thumbnails", dbg_aa_thumbs },
 #endif
         { "View buffering thread", dbg_buffering_thread },
 #ifdef PM_DEBUG

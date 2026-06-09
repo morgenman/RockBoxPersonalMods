@@ -11613,17 +11613,17 @@
   </voice>
 </phrase>
 <phrase>
-  id: LANG_THUMB_ROW_HEIGHT
-  desc: row height override for album art thumbnails
+  id: LANG_THUMB_ART_SIZE
+  desc: art size for album art thumbnails (row height = art size + 4px)
   user: core
   <source>
-    *: "Album Art Row Height"
+    *: "Album Art Size"
   </source>
   <dest>
-    *: "Album Art Row Height"
+    *: "Album Art Size"
   </dest>
   <voice>
-    *: "Album Art Row Height"
+    *: "Album Art Size"
   </voice>
 </phrase>
 <phrase>
@@ -11652,6 +11652,20 @@
   </dest>
   <voice>
     *: "Show Album Art"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_BUILD_ALBUM_ART
+  desc: trigger album art thumbnail generation at the current size
+  user: core
+  <source>
+    *: "Build Album Art"
+  </source>
+  <dest>
+    *: "Build Album Art"
+  </dest>
+  <voice>
+    *: "Build Album Art"
   </voice>
 </phrase>
 <phrase>

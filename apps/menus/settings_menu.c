@@ -128,15 +128,12 @@ int mask = global_settings.bt_selective_softlock_actions_mask;
 
 static void tagcache_rebuild_with_splash(void)
 {
-    aa_thumbcache_clear();    /* wipe stale thumbs before full rebuild */
-    aa_thumbcache_refresh();  /* generate new thumbs after commit */
     tagcache_rebuild();
     splash(HZ*2, ID2P(LANG_TAGCACHE_FORCE_UPDATE_SPLASH));
 }
 
 static void tagcache_update_with_splash(void)
 {
-    aa_thumbcache_refresh();  /* generate missing thumbs after commit */
     tagcache_update();
     splash(HZ*2, ID2P(LANG_TAGCACHE_FORCE_UPDATE_SPLASH));
 }

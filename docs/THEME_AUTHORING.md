@@ -43,26 +43,61 @@ with the theme background.
 
 ---
 
-## Album Art Row Height (Database View Only)
+## Album Art Size (Database View Only)
 
-Overrides the row height in the database browser (ID3 tag view) to make room for
-album art thumbnails. Has no effect in the file browser or any other screen.
+Sets the thumbnail pixel size in the database browser (ID3 tag view). The row
+height is automatically `art size + 4px` to leave a small margin around the image.
+Has no effect in the file browser or any other screen.
 
-**Config key:** `album art row height`  
-**Values:** `auto` (use font height, default), `20`, `24`, `28`, `32`, `36`, `40`, `44`, `48` (pixels)  
-**User override:** Theme Settings → Album Art Row Height
+**Config key:** `album art size`  
+**Values:** `auto` (derive from font height, default), `16`, `20`, `24`, `28`, `32`,
+`36`, `40`, `44`, `64`, `96`, `128` (the **art/thumbnail** size in pixels — row height
+is this value plus 4)  
+**User override:** Theme Settings → Album Art Size
 
 ```cfg
-# 48px rows give comfortable space for a 44px thumbnail:
-album art row height: 48
+# 44px art thumbnails → row height is 48px automatically:
+album art size: 44
 ```
 
-The thumbnail size is derived automatically as `row height − 4px`. At `auto`, the
-thumbnail size is derived from the font height instead.
+At `auto`, the thumbnail size is derived from the theme's default line height minus 4px.
 
 Album art is only shown in the **database view** (Artists → Albums → Tracks, etc.),
-never in the file browser. One thumbnail per album is cached to disk at
-`/.rockbox/thumbcache/`. The cache is built automatically after a database update.
+never in the file browser. One thumbnail per album per size is cached to disk in
+`/.rockbox/thumbcache/Np/` (e.g. `44p/` for 44px thumbnails). The cache is built
+from **Debug → Album Art Thumbnails** — it is no longer built automatically on
+database update.
+
+| Art size | Row height | Notes |
+|---|---|---|
+| 16 | 20 | Compact |
+| 20 | 24 | |
+| 24 | 28 | |
+| 28 | 32 | |
+| 32 | 36 | |
+| 36 | 40 | |
+| 40 | 44 | |
+| 44 | 48 | Maximum for most icon-size themes |
+| 64 | 68 | Large thumbnail look |
+| 96 | 100 | |
+| 128 | 132 | Maximum supported size |
+
+### Theme-preferred auto size
+
+If the user has "Album Art Size" set to Auto, a theme can suggest a specific size
+that takes priority over the font-derived default:
+
+**Config key:** `album art theme size`  
+**Value:** Art size in pixels, or `0` (unset, default)
+
+```cfg
+# Suggest 44px art when the user hasn't overridden the size:
+album art theme size: 44
+```
+
+This key is theme-controlled (`F_THEMESETTING`) and is never shown in any user menu.
+It has no effect if the user has chosen an explicit size from the "Album Art Size"
+menu.
 
 ---
 
@@ -83,12 +118,12 @@ When set to `n`, the artwork is inset `n` pixels from each edge of its slot. The
 row height grows by `2n` automatically to keep the artwork at full size. The
 thumbnail itself is **not** shrunk — only the surrounding space increases.
 
-| Row Height | Padding | Effective Row Height |
+| Art Size | Padding | Effective Row Height |
 |---|---|---|
-| 32 | 0 | 32 (unchanged) |
-| 32 | 2 | 36 |
-| 32 | 4 | 40 |
-| 48 | 3 | 54 |
+| 28 | 0 | 32 |
+| 28 | 2 | 36 |
+| 28 | 4 | 40 |
+| 44 | 3 | 54 |
 
 ---
 
@@ -119,21 +154,18 @@ theme's `.cfg` settings.
 ### Image Format
 
 - **Format:** BMP, 24-bit or 16-bit RGB
-- **Recommended size:** 44×44 px (the maximum thumbnail size)
+- **Recommended size:** 128×128 px (the maximum thumbnail size)
 - **Aspect ratio:** Square (1:1). Non-square images will be stretched.
 
 Rockbox scales the image to the current thumbnail size automatically, so one
-file covers every row height setting. Design it to read clearly at small sizes
-(as small as 12×12 px when the row height is 16 px).
+file covers all size settings.
 
 ### When the fallback is cached
 
-A pre-scaled `.bin` is generated in `/.rockbox/thumbcache/` during the database
-update (same pass that builds album thumbnails). This means the fallback image is
-ready the first time the database browser opens — no BMP decode at browse time.
-
-If the fallback `.cfg` key is set but the database has not been updated since, the
-firmware decodes the BMP on first use and caches it for subsequent opens.
+A pre-scaled `.bin` is generated in `/.rockbox/thumbcache/Np/` when the Debug →
+Album Art Thumbnails build runs. If the fallback `.cfg` key is set but the build
+has not been run since, the firmware decodes the BMP on first browse-view access
+and caches it for subsequent opens.
 
 ### Removing it
 
@@ -160,7 +192,8 @@ config key. The firmware implementation is:
 ```cfg
 # --- RockboxMod extensions ---
 list corner radius: 6
-album art row height: 48
+album art size: 44
+album art theme size: 44
 album art padding: 2
 album art fallback: /.rockbox/themes/mytheme_fallback.bmp
 ```
