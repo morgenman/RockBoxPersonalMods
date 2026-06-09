@@ -204,6 +204,7 @@ bool tagcache_fill_tags(struct mp3entry *id3, const char *filename);
 void tagcache_unload_ramcache(void);
 #endif
 void tagcache_commit_finalize(void);
+void tagcache_set_commit_callback(void (*cb)(void));
 void tagcache_init(void) INIT_ATTR;
 bool tagcache_is_initialized(void);
 bool tagcache_is_fully_initialized(void);

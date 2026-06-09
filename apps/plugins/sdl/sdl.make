@@ -29,7 +29,9 @@ OTHER_INC += -I$(SDL_SRCDIR)/include
 SDLFLAGS = -I$(SDL_SRCDIR)/include $(filter-out -O%,$(PLUGINFLAGS))		\
 -O3 -Wno-unused-parameter -Xpreprocessor -Wno-undef -Wcast-align	\
 -ffast-math -funroll-loops -fomit-frame-pointer -fexpensive-optimizations	\
--D_GNU_SOURCE=1 -D_REENTRANT -DSDL -DELF -w # disable all warnings
+-D_GNU_SOURCE=1 -D_REENTRANT -DSDL -DELF -w \
+-Wno-int-conversion -Wno-incompatible-pointer-types \
+-Wno-implicit-function-declaration -Wno-implicit-int # disable all warnings
 
 # WIP SDLFLAGS for warning deletions
 #SDLFLAGS = -I$(SDL_SRCDIR)/include $(filter-out -O%,$(PLUGINFLAGS))		\

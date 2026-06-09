@@ -57,6 +57,7 @@
 #include "plugin.h"
 #include "onplay.h"
 #include "misc.h"
+#include "tree.h"
 
 #if defined(DX50) || defined(DX90) || (defined(HAVE_USB_POWER) && !defined(USB_NONE) && !defined(SIMULATOR))
 #define HAVE_USB_MODE

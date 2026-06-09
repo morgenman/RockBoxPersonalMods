@@ -2817,6 +2817,19 @@ char* tagtree_get_entry_name(struct tree_context *c, int id,
 }
 
 
+/* Return the album name associated with entry id (populated from tag_album for
+ * every track entry, including TABLE_ALLSUBENTRIES* rows).  Returns buf on
+ * success, NULL if the entry has no album_name (e.g. virtual/special entries). */
+char *tagtree_get_entry_album(struct tree_context *c, int id,
+                              char *buf, size_t bufsize)
+{
+    struct tagentry *entry = tagtree_get_entry(c, id);
+    if (!entry || !entry->album_name || !entry->album_name[0])
+        return NULL;
+    strmemccpy(buf, entry->album_name, bufsize);
+    return buf;
+}
+
 char *tagtree_get_title(struct tree_context* c)
 {
     switch (c->currtable)
@@ -2834,6 +2847,13 @@ char *tagtree_get_title(struct tree_context* c)
     }
 
     return "?";
+}
+
+int tagtree_browse_tag(struct tree_context *c)
+{
+    if (c->currtable != TABLE_NAVIBROWSE)
+        return -1;
+    return csi->tagorder[c->currextra];
 }
 
 int tagtree_get_attr(struct tree_context* c)

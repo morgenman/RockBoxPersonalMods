@@ -608,7 +608,6 @@ static int codepage_callback(int action,
 
 MENUITEM_SETTING(codepage_setting, &global_settings.default_codepage, codepage_callback);
 
-
 MAKE_MENU(display_menu, ID2P(LANG_DISPLAY),
             NULL, Icon_Display_menu,
             &lcd_settings,

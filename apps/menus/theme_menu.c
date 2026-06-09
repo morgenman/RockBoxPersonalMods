@@ -384,6 +384,28 @@ MENUITEM_SETTING(cursor_style, &global_settings.cursor_style, NULL);
 #if LCD_DEPTH > 1
 MENUITEM_SETTING(sep_menu, &global_settings.list_separator_height, NULL);
 #endif
+#if LCD_DEPTH > 1 && defined(HAVE_TAGCACHE)
+MENUITEM_SETTING(show_album_art_setting, &global_settings.show_album_art, NULL);
+MENUITEM_SETTING(thumb_art_size_setting, &global_settings.thumb_art_size, NULL);
+MENUITEM_SETTING(thumb_art_padding_setting, &global_settings.thumb_art_padding, NULL);
+
+static bool theme_build_album_art(void)
+{
+    if (aa_get_build_stat()->active)
+    {
+        splash(HZ, "Already building...");
+        return false;
+    }
+    aa_thumbcache_build_start();
+    splash(HZ, "Building thumbnails...");
+    return false;
+}
+MENUITEM_FUNCTION(build_album_art_item, 0, ID2P(LANG_BUILD_ALBUM_ART),
+                  theme_build_album_art, NULL, Icon_NOICON);
+#endif
+#if LCD_DEPTH > 1
+MENUITEM_SETTING(list_corner_radius_setting, &global_settings.list_corner_radius, NULL);
+#endif
 
 MAKE_MENU(theme_menu, ID2P(LANG_THEME_MENU),
             NULL, Icon_Wps,
@@ -411,6 +433,13 @@ MAKE_MENU(theme_menu, ID2P(LANG_THEME_MENU),
             &cursor_style,
 #if LCD_DEPTH > 1
             &sep_menu,
+            &list_corner_radius_setting,
+#endif
+#if LCD_DEPTH > 1 && defined(HAVE_TAGCACHE)
+            &show_album_art_setting,
+            &thumb_art_size_setting,
+            &thumb_art_padding_setting,
+            &build_album_art_item,
 #endif
 #ifdef HAVE_LCD_COLOR
             &colors_settings,

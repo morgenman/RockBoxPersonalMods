@@ -11613,6 +11613,76 @@
   </voice>
 </phrase>
 <phrase>
+  id: LANG_THUMB_ART_SIZE
+  desc: art size for album art thumbnails (row height = art size + 4px)
+  user: core
+  <source>
+    *: "Album Art Size"
+  </source>
+  <dest>
+    *: "Album Art Size"
+  </dest>
+  <voice>
+    *: "Album Art Size"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_THUMB_ART_PADDING
+  desc: padding in pixels around the artwork inside its container
+  user: core
+  <source>
+    *: "Album Art Padding"
+  </source>
+  <dest>
+    *: "Album Art Padding"
+  </dest>
+  <voice>
+    *: "Album Art Padding"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_SHOW_ALBUM_ART
+  desc: toggle album art thumbnails in the database browser
+  user: core
+  <source>
+    *: "Show Album Art"
+  </source>
+  <dest>
+    *: "Show Album Art"
+  </dest>
+  <voice>
+    *: "Show Album Art"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_BUILD_ALBUM_ART
+  desc: trigger album art thumbnail generation at the current size
+  user: core
+  <source>
+    *: "Build Album Art"
+  </source>
+  <dest>
+    *: "Build Album Art"
+  </dest>
+  <voice>
+    *: "Build Album Art"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_LIST_CORNER_RADIUS
+  desc: rounded corner radius for list items; set by theme or user
+  user: core
+  <source>
+    *: "List Corner Radius"
+  </source>
+  <dest>
+    *: "List Corner Radius"
+  </dest>
+  <voice>
+    *: "List Corner Radius"
+  </voice>
+</phrase>
+<phrase>
   id: LANG_SHORTCUTS
   desc: Title in the shortcuts menu
   user: core
